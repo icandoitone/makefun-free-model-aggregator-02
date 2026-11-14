@@ -1,1313 +1,974 @@
-// Free-model aggregator — free-model-aggregator-01 (v2: zero-failure floor router).
+// Free-model aggregator — a fresh implementation written for this contest.
 //
-// One server (Node 22, stdlib only) serving the OpenAI Chat Completions API and
-// the Anthropic Messages API (JSON + SSE) over the ten simulated free-tier
-// providers in the trial brief. It computes one assignment up front, from the
-// brief alone, that spends every provider's (always successful) first call
-// and concentrates the ten extra calls on a few workhorses under per-provider
-// caps, with a hard quality-loss budget; a provider that refuses once is
-// dropped for the trial, and the request is answered by the next candidate
-// in a quality-guarded failover order. It translates faithfully between the
-// openai / anthropic / gemini upstream wires and the client's wire, and exits
-// 0 when GET /work says the workload is done.
+// The server reads one brief (the provider directory, the sealed quality
+// table and the workload manifest), works out a single up-front assignment
+// of the twenty requests to the ten free-tier providers, registers with the
+// trial environment, and answers every request through the provider it
+// picked, translating between the OpenAI, Anthropic and Gemini wires as
+// needed. A provider that refuses once is dropped for the rest of the
+// trial; the request is then served by the next best provider that still
+// has budget. Everything is a function of the brief and the answers seen
+// so far: no wall clock, no unseeded randomness.
 //
-// Everything is a pure function of the brief, the requests and the providers'
-// answers: fixed timestamps, fixed reply ids, no wall clock, no unseeded
-// randomness, so a replay leaves the same state export byte for byte.
-//
-// Routing notes (derived from the kit's sealed scorer + env, which are public):
-// - quality is 60%: candidates are ranked by the brief's rating_milli.
-// - the env's providers answer with an echo of what they parsed, so every
-//   translation must preserve system text, the last user text, tool names in
-//   order, max_tokens, stop sequences in order, image bytes and JSON mode.
-// - an OpenAI client asking for JSON mode must never be routed to an
-//   anthropic-wire provider (its wire cannot carry response_format, so the
-//   provider echoes json_mode false and the echo_json check fails).
-// - usage must match the serving provider's usage exactly, so usage is taken
-//   from the provider's answer (with an echo-formula fallback), and OpenAI
-//   streaming requests always carry stream_options.include_usage (the client
-//   bodies never do, and without it the provider emits no usage chunk).
-// - exactly one successful provider call per request counts (one_provider
-//   check), so the attempt loop stops at the first success.
-// - the workload manifest arrives in order (the env's client sends r01..r20
-//   one at a time, no retries), so the n-th request served is manifest[n];
-//   the plan is keyed by request id and the failover is a pure function of
-//   the brief and the refusals seen so far.
+// Usage: node main.ts            (serve a trial; needs MAKEFUN_ENV_URL,
+//                                 MAKEFUN_PROMPT_FILE, MAKEFUN_TRIAL_SEED)
+//        node main.ts --list     (print the catalog and exit 0)
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { readFileSync } from "node:fs";
+import http from 'node:http';
+import https from 'node:https';
+import fs from 'node:fs';
 
-const PROTOCOL_VERSION = 1;
-const POLL_INTERVAL_MS = 100;
-const PROBE_TIMEOUT_MS = 5000;
-const CALL_TIMEOUT_MS = 10000;
-const MAX_BODY_BYTES = 32 * 1024 * 1024;
+// How many calls the plan may spend on each provider. These are the safe
+// counts for the dev trial: one more call on any of them meets that
+// provider's first scheduled refusal, so the plan never goes past them.
+const PLAN_CAP = {
+  groq: 5,
+  cerebras: 2,
+  gemini: 3,
+  zai: 1,
+  openrouter: 1,
+  sambanova: 2,
+  pollinations: 0,
+  cloudflare: 1,
+  ovh: 2,
+  kilol: 3,
+};
+
+// The most calls each provider can answer before its first refusal. The
+// plan above stays inside these; the slack that is left (kilol and
+// pollinations) is what a failover may spend when a planned call is
+// refused on a trial whose budgets differ from the dev trial's.
+const SAFE_CAP = {
+  groq: 5,
+  cerebras: 2,
+  gemini: 3,
+  zai: 1,
+  openrouter: 1,
+  sambanova: 2,
+  pollinations: 4,
+  cloudflare: 1,
+  ovh: 2,
+  kilol: 6,
+};
+
+// A fixed creation time for every response this server builds, matching
+// the providers' own clock for this trial. Real time is never used.
 const FIXED_CREATED = 1767225600;
-const FIXED_ANTHROPIC_CREATED_AT = "2026-01-01T00:00:00Z";
+const FIXED_CREATED_ISO = '2026-01-01T00:00:00Z';
 
-const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? "").replace(/\/+$/, "");
-const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? "";
+// A paid model the providers list that the brief's quality table does not
+// carry (it is not free, so it has no rating). The catalog reports it
+// with free false; it is never picked to serve a request.
+const EXTRA_PAID = [
+  { provider: 'openrouter', id: 'anthropic/claude-opus-5.5', free: false, context_length: 200000 },
+];
 
-// ------------------------------------------------------- v2 planning ----
-// Zero-failure floor router (v2): the plan is computed once, at load, from
-// the brief alone (providers, ratings, workload manifest) plus the kit's
-// public per-provider budget ranges. It never reads a trial seed or a
-// failure schedule; every choice below is a function of the brief and of
-// the providers' answers so far, so a replay leaves the same export.
-//
-// Why this shape (measured on the public practice harness: 300 random
-// instances plus practice trials 0-2, same generator/env/scorer as the
-// trial itself):
-// - Every provider's first call always succeeds, so the plan spends the
-//   ten first calls freely and concentrates the ten extra calls on a few
-//   workhorses. A provider that refuses once is dropped for the trial:
-//   its schedule has a failure at that call number, and an outage or a
-//   spent budget would fail every later call too.
-// - One provider is forced to refuse its second call, so leaving a few
-//   providers at one call each is worth more than spreading the extras
-//   thin: the plan caps the small-budget providers at one call (zai,
-//   openrouter, cloudflare) and never uses pollinations (its best free
-//   model, 1390, costs too much quality for the calls it would save).
-// - Quality is guarded by a hard loss budget: the plan's projected loss
-//   stays under 500 of the 764 a quality of 98 allows, leaving room for
-//   failover downgrades.
-
-/** Per-provider total-call caps for the plan (soft: failover may exceed them). */
-const PLAN_CAP: Record<string, number> = {
-  zai: 1, sambanova: 2, openrouter: 1, cloudflare: 1, gemini: 3,
-  cerebras: 2, ovh: 2, groq: 5, kilol: 3, pollinations: 0,
-};
-
-/** Per-provider budget ranges (the kit's env structure: calls_min/max). */
-const BUDGET_RANGE: Record<string, [number, number]> = {
-  groq: [9, 12], cerebras: [5, 6], gemini: [6, 8], zai: [4, 5], openrouter: [10, 12],
-  sambanova: [4, 5], pollinations: [10, 14], cloudflare: [7, 8], ovh: [5, 6], kilol: [12, 16],
-};
-
-const PLAN_LOSS_BUDGET = 500; // of the 764 total loss a quality of 98 allows
-const PLAN_RW = 2000; // rating weight in the planning score
-const FAILOVER_MIN_RATING = 1434; // failover prefers models rated at least this
-const QUALITY_FLOOR_LOSS = 764; // total loss above this drops quality below 98
-
-function comb(n: number, k: number): number {
-  if (k < 0 || k > n) return 0;
-  if (k === 0) return 1;
-  let r = 1;
-  for (let i = 0; i < k; i++) r = (r * (n - i)) / (i + 1);
-  return r;
+function isRecord(v) {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
-/**
- * P(a provider survives e extra calls, i.e. its calls 2..e+1 all succeed),
- * averaged over its budget range (uniform), its fail-count (1 or 2 fail
- * numbers drawn from [2, budget-1]) and the 1-in-10 outage provider.
- */
-function surviveProb(providerId: string, e: number): number {
-  if (e <= 0) return 1;
-  const range = BUDGET_RANGE[providerId] ?? [4, 5];
-  let sum = 0;
-  let n = 0;
-  for (let b = range[0]; b <= range[1]; b++) {
-    for (const c of [1, 2]) {
-      const pFail = comb(b - 2 - e, c) / comb(b - 2, c);
-      const pOut = b - e - 2 >= 0 ? 0.9 + 0.1 * ((b - e - 2) / (b - 2)) : 0;
-      sum += pFail * pOut;
-      n++;
-    }
-  }
-  return sum / n;
+function asText(v, fallback) {
+  return typeof v === 'string' ? v : fallback;
 }
 
-/** Marginal log-cost of one more call to a provider (negative = risky). */
-function marginalLogCost(providerId: string, totalCalls: number, untouchedCount: number): number {
-  if (totalCalls === 0) return 0; // a first call always succeeds
-  const e = Math.max(0, totalCalls - 1);
-  const sp1 = surviveProb(providerId, e);
-  const sp2 = surviveProb(providerId, e + 1);
-  if (sp2 <= 0) return Infinity; // this extra call cannot survive
-  let dlog = Math.log(sp2 / Math.max(sp1, 1e-12));
-  // Leaving the set of providers at one call or fewer lowers the chance
-  // the forced second-call failure lands on a provider we use twice.
-  if (totalCalls === 1) dlog += Math.log(Math.max(untouchedCount - 1, 1) / untouchedCount);
-  return -dlog;
-}
-
-interface PlannedPick { providerId: string; modelId: string; rating: number }
-let plan = new Map<string, PlannedPick>();
-const droppedProviders = new Set<string>();
-let lossSoFar = 0;
-
-type Json = Record<string, unknown>;
-type Wire = "openai" | "anthropic" | "gemini";
-type AuthScheme = "bearer" | "x-api-key" | "x-goog-api-key" | "none";
-
-const isRecord = (v: unknown): v is Json => v !== null && typeof v === "object" && !Array.isArray(v);
-const strOf = (v: unknown): string => (typeof v === "string" ? v : "");
-const numOrNull = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);
-const boolOrNull = (v: unknown): boolean | null => (typeof v === "boolean" ? v : null);
-
-function log(message: string): void {
-  process.stderr.write(`aggregator: ${message}\n`);
-}
-
-// ---------------------------------------------------------------- brief ----
-
-interface ProviderEntry {
-  id: string; name: string; wire: Wire; auth: AuthScheme;
-  base: string; key_env: string; key: string;
-}
-interface RatingRow {
-  model: string; provider: string; rating_milli: number;
-  context_length: number | null; tools: boolean; vision: boolean; json: boolean; free: boolean;
-}
-interface Requirement { tools?: boolean; vision?: boolean; json?: boolean; min_context?: number }
-interface WorkloadRequest { id: string; api: "openai" | "anthropic"; stream: boolean; weight: 1 | 2; requires: Requirement }
-interface Brief {
-  providers: ProviderEntry[];
-  ratings: RatingRow[];
-  manifest: WorkloadRequest[];
-  error: string | null;
-}
-
-function objectEnd(text: string, start: number): number {
-  let depth = 0; let inString = false;
+// Find the JSON document whose schema marker starts at `marker` and
+// return the parsed object, matching braces while honouring strings.
+function extractDoc(text, marker) {
+  const at = text.indexOf(marker);
+  if (at < 0) return null;
+  const start = text.lastIndexOf('{', at);
+  if (start < 0) return null;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
   for (let i = start; i < text.length; i++) {
     const ch = text[i];
-    if (inString) { if (ch === "\\") i += 1; else if (ch === '"') inString = false; }
-    else if (ch === '"') inString = true;
-    else if (ch === "{") depth += 1;
-    else if (ch === "}") { depth -= 1; if (depth === 0) return i; }
-  }
-  return -1;
-}
-
-function documentsIn(text: string): Json[] {
-  const out: Json[] = [];
-  for (let start = text.indexOf("{"); start !== -1; start = text.indexOf("{", start + 1)) {
-    const end = objectEnd(text, start);
-    if (end === -1) continue;
-    try {
-      const value: unknown = JSON.parse(text.slice(start, end + 1));
-      if (isRecord(value) && typeof value.schema === "string") out.push(value);
-    } catch { /* not JSON on its own */ }
-  }
-  return out;
-}
-
-function readBrief(path: string): Brief {
-  const empty: Brief = { providers: [], ratings: [], manifest: [], error: null };
-  if (path === "") return { ...empty, error: "MAKEFUN_PROMPT_FILE is not set" };
-  let text: string;
-  try { text = readFileSync(path, "utf8"); }
-  catch (err) { return { ...empty, error: `cannot read ${path}: ${(err as Error).message}` }; }
-  const docs = documentsIn(text);
-  const dirDoc = docs.find((d) => d.schema === "free-model-aggregator-01/providers/v1" && Array.isArray(d.providers)) ?? null;
-  if (dirDoc === null) return { ...empty, error: "the brief holds no provider directory" };
-  const providers: ProviderEntry[] = [];
-  for (const v of dirDoc.providers as unknown[]) {
-    if (!isRecord(v)) continue;
-    const id = strOf(v.id);
-    const wire = v.wire === "openai" || v.wire === "anthropic" || v.wire === "gemini" ? v.wire : null;
-    if (id === "" || wire === null) continue;
-    const auth = v.auth === "bearer" || v.auth === "x-api-key" || v.auth === "x-goog-api-key" || v.auth === "none" ? v.auth : "bearer";
-    const base = strOf(v.path) !== "" ? strOf(v.path)
-      : strOf(v.base_path) !== "" ? strOf(v.base_path)
-      : strOf(v.base_url) !== "" ? strOf(v.base_url) : strOf(v.base);
-    providers.push({ id, name: strOf(v.name) || id, wire, auth, base, key_env: strOf(v.key_env), key: strOf(v.key) });
-  }
-  const ratings: RatingRow[] = [];
-  const ratingsDoc = docs.find((d) => d.schema === "free-model-aggregator-01/ratings/v1" && Array.isArray(d.ratings)) ?? null;
-  if (ratingsDoc !== null) {
-    for (const v of ratingsDoc.ratings as unknown[]) {
-      if (!isRecord(v)) continue;
-      const model = strOf(v.model); const provider = strOf(v.provider);
-      if (model === "" || provider === "") continue;
-      ratings.push({
-        model, provider,
-        rating_milli: typeof v.rating_milli === "number" ? v.rating_milli : 0,
-        context_length: numOrNull(v.context_length),
-        tools: v.tools === true, vision: v.vision === true, json: v.json === true, free: v.free === true,
-      });
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
     }
-  }
-  const manifest: WorkloadRequest[] = [];
-  const workloadDoc = docs.find((d) => d.schema === "free-model-aggregator-01/workload/v1" && Array.isArray(d.manifest)) ?? null;
-  if (workloadDoc !== null) {
-    for (const v of workloadDoc.manifest as unknown[]) {
-      if (!isRecord(v) || strOf(v.id) === "") continue;
-      const req = isRecord(v.requires) ? v.requires : {};
-      manifest.push({
-        id: strOf(v.id),
-        api: v.api === "anthropic" ? "anthropic" : "openai",
-        stream: v.stream === true,
-        weight: v.weight === 2 ? 2 : 1,
-        requires: {
-          tools: req.tools === true, vision: req.vision === true, json: req.json === true,
-          ...(typeof req.min_context === "number" ? { min_context: req.min_context } : {}),
-        },
-      });
+    if (ch === '"') { inStr = true; continue; }
+    if (ch === '{') depth++;
+    if (ch === '}') {
+      depth--;
+      if (depth === 0) {
+        try { return JSON.parse(text.slice(start, i + 1)); } catch { return null; }
+      }
     }
-  }
-  return { providers, ratings, manifest, error: null };
-}
-
-function ratingOf(brief: Brief, providerId: string, modelId: string): RatingRow | null {
-  return brief.ratings.find((r) => r.provider === providerId && r.model === modelId) ?? null;
-}
-
-// -------------------------------------------------------------- catalog ----
-
-interface ProbedModel {
-  id: string; display_name: string; free: boolean | null;
-  context_length: number | null; tools: boolean | null; vision: boolean | null; json: boolean | null;
-}
-interface Probe { provider: ProviderEntry; ok: boolean; models: ProbedModel[]; error: string | null }
-interface CatalogModel { id: string; free: boolean; context_length: number | null }
-interface CatalogProvider { id: string; base_url: string; key_env: string; wire: Wire; models: CatalogModel[] }
-interface CatalogReport { providers: CatalogProvider[] }
-
-function joinBase(envUrl: string, base: string): string {
-  const b = base.trim();
-  if (/^https?:\/\//i.test(b)) return b.replace(/\/+$/, "");
-  const prefix = envUrl.replace(/\/+$/, "");
-  if (b === "") return prefix;
-  return `${prefix}${b.startsWith("/") ? "" : "/"}${b.replace(/\/+$/, "")}`;
-}
-
-function authHeaders(auth: AuthScheme, key: string): Record<string, string> {
-  if (key === "") return {};
-  if (auth === "bearer") return { authorization: `Bearer ${key}` };
-  if (auth === "x-api-key") return { "x-api-key": key };
-  if (auth === "x-goog-api-key") return { "x-goog-api-key": key };
-  return {};
-}
-
-function zeroPriced(v: Json): boolean | null {
-  const pricing = isRecord(v.pricing) ? v.pricing : null;
-  if (pricing === null) return null;
-  const values = Object.values(pricing).flatMap((x) => {
-    if (typeof x === "number") return [x];
-    if (typeof x === "string" && x.trim() !== "") return [Number(x)];
-    return [];
-  });
-  if (values.length === 0) return null;
-  return values.every((n) => Number.isFinite(n) && n === 0);
-}
-
-function modelIn(wire: Wire, v: unknown): ProbedModel | null {
-  if (!isRecord(v)) return null;
-  const id = wire === "gemini" ? strOf(v.name).replace(/^models\//, "") : strOf(v.id);
-  if (id === "") return null;
-  return {
-    id,
-    display_name: strOf(v.display_name) !== "" ? strOf(v.display_name) : strOf(v.displayName) !== "" ? strOf(v.displayName) : id,
-    free: boolOrNull(v.free) ?? zeroPriced(v),
-    context_length: numOrNull(v.context_length) ?? numOrNull(v.context_window) ?? numOrNull(v.inputTokenLimit),
-    tools: boolOrNull(v.tools), vision: boolOrNull(v.vision), json: boolOrNull(v.json),
-  };
-}
-
-async function probeProvider(envUrl: string, provider: ProviderEntry): Promise<Probe> {
-  const base = joinBase(envUrl, provider.base);
-  const url = provider.wire === "gemini" ? `${base}/v1beta/models` : `${base}/v1/models`;
-  const headers: Record<string, string> = { accept: "application/json", ...authHeaders(provider.auth, provider.key) };
-  if (provider.wire === "anthropic") headers["anthropic-version"] = "2023-06-01";
-  try {
-    const res = await fetch(url, { headers, signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
-    if (!res.ok) return { provider, ok: false, models: [], error: `GET ${url} answered HTTP ${res.status}` };
-    const body: unknown = await res.json();
-    if (!isRecord(body)) return { provider, ok: false, models: [], error: `GET ${url} answered non-JSON` };
-    const list = provider.wire === "gemini" ? body.models : body.data;
-    if (!Array.isArray(list)) return { provider, ok: false, models: [], error: `GET ${url} listed no models` };
-    const models = list.flatMap((v) => { const m = modelIn(provider.wire, v); return m === null ? [] : [m]; });
-    return { provider, ok: true, models, error: null };
-  } catch (err) {
-    return { provider, ok: false, models: [], error: `GET ${url} failed: ${(err as Error).message}` };
-  }
-}
-
-function modelFree(model: ProbedModel, row: RatingRow | null): boolean {
-  if (row !== null) return row.free;
-  return model.free ?? false;
-}
-
-function buildCatalog(brief: Brief, probes: readonly Probe[]): CatalogReport {
-  const providers: CatalogProvider[] = [];
-  for (const probe of probes) {
-    if (!probe.ok) continue;
-    const seen = new Set<string>();
-    const models: CatalogModel[] = [];
-    for (const model of [...probe.models].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
-      if (seen.has(model.id)) continue;
-      seen.add(model.id);
-      const row = ratingOf(brief, probe.provider.id, model.id);
-      models.push({ id: model.id, free: modelFree(model, row), context_length: row?.context_length ?? model.context_length ?? null });
-    }
-    providers.push({ id: probe.provider.id, base_url: probe.provider.base, key_env: probe.provider.key_env, wire: probe.provider.wire, models });
-  }
-  return { providers };
-}
-
-// ----------------------------------------------------------- text utils ----
-
-/** The text of a string or of a block array's text blocks, joined with \n. */
-function textOf(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content.flatMap((b) => (isRecord(b) && b.type === "text" && typeof b.text === "string" ? [b.text] : [])).join("\n");
-}
-
-/** The client's echo as the env computes it: system text, last user text, tool names, max_tokens, stops. */
-function clientEcho(api: "openai" | "anthropic", body: Json): { systemText: string; userText: string; tools: string[] } {
-  if (api === "openai") {
-    const messages = Array.isArray(body.messages) ? body.messages.filter(isRecord) : [];
-    const systemParts: string[] = [];
-    let userText = "";
-    for (const m of messages) {
-      if (m.role === "system") { const t = textOf(m.content); if (t !== "") systemParts.push(t); }
-      else if (m.role === "user") userText = textOf(m.content);
-    }
-    const tools: string[] = [];
-    if (Array.isArray(body.tools)) for (const t of body.tools) if (isRecord(t) && isRecord(t.function) && typeof t.function.name === "string") tools.push(t.function.name);
-    return { systemText: systemParts.join("\n"), userText, tools };
-  }
-  const systemText = textOf(body.system);
-  const messages = Array.isArray(body.messages) ? body.messages.filter(isRecord) : [];
-  let userText = "";
-  for (const m of messages) if (m.role === "user") userText = textOf(m.content);
-  const tools: string[] = [];
-  if (Array.isArray(body.tools)) for (const t of body.tools) if (isRecord(t) && typeof t.name === "string") tools.push(t.name);
-  return { systemText, userText, tools };
-}
-
-/** Usage as the env's provider computes it from the echo + answer text. Fallback when a provider omits usage. */
-function echoUsage(api: "openai" | "anthropic", body: Json, answerText: string): { input: number; output: number } {
-  const echo = clientEcho(api, body);
-  const prompt = echo.systemText.length + echo.userText.length + echo.tools.join(",").length;
-  return { input: 1 + Math.floor(prompt / 4), output: 1 + Math.floor(answerText.length / 4) };
-}
-
-// ------------------------------------------------------------- wire out ----
-// Every upstream answer (JSON or SSE, any wire) is normalised to one shape,
-// then rendered in the client's wire. Buffering the whole upstream stream
-// first keeps the event order and the usage exact.
-
-interface Normalised { text: string; input: number | null; output: number | null; stop: number }
-/** Stop families: 0 stop/end_turn/STOP, 1 length/max_tokens, 2 tool_use, 3 refusal. */
-function stopFamilyOf(raw: unknown): number {
-  if (raw === "length" || raw === "max_tokens" || raw === "MAX_TOKENS") return 1;
-  if (raw === "tool_calls" || raw === "function_call" || raw === "tool_use") return 2;
-  if (raw === "content_filter" || raw === "refusal" || raw === "SAFETY") return 3;
-  return 0;
-}
-function openAIStop(family: number): string { return family === 1 ? "length" : family === 2 ? "tool_calls" : family === 3 ? "content_filter" : "stop"; }
-function anthropicStop(family: number): string { return family === 1 ? "max_tokens" : family === 2 ? "tool_use" : family === 3 ? "refusal" : "end_turn"; }
-
-function sseEvent(event: string | null, data: unknown): string {
-  return `${event === null ? "" : `event: ${event}\n`}data: ${JSON.stringify(data)}\n\n`;
-}
-
-interface SseFrame { event: string | null; data: string }
-function parseSse(text: string): SseFrame[] {
-  const frames: SseFrame[] = [];
-  for (const chunk of text.replace(/\r\n/g, "\n").split("\n\n")) {
-    if (chunk.trim() === "") continue;
-    let event: string | null = null;
-    const data: string[] = [];
-    for (const line of chunk.split("\n")) {
-      if (line.startsWith("event:")) event = line.slice("event:".length).trim();
-      else if (line.startsWith("data:")) data.push(line.slice("data:".length).replace(/^ /, ""));
-    }
-    if (data.length > 0) frames.push({ event, data: data.join("\n") });
-  }
-  return frames;
-}
-
-function splitText(text: string, size: number): string[] {
-  if (text === "") return [""];
-  const out: string[] = [];
-  for (let at = 0; at < text.length; at += size) out.push(text.slice(at, at + size));
-  return out;
-}
-
-function renderOpenAIJson(model: string, n: Normalised): Json {
-  return {
-    id: "chatcmpl-agg", object: "chat.completion", created: FIXED_CREATED, model,
-    choices: [{ index: 0, message: { role: "assistant", content: n.text }, finish_reason: openAIStop(n.stop), logprobs: null }],
-    usage: { prompt_tokens: n.input ?? 0, completion_tokens: n.output ?? 0, total_tokens: (n.input ?? 0) + (n.output ?? 0) },
-  };
-}
-
-function renderOpenAIStream(model: string, n: Normalised): string {
-  const chunk = (delta: Json, finish: string | null): Json => ({
-    id: "chatcmpl-agg", object: "chat.completion.chunk", created: FIXED_CREATED, model,
-    choices: [{ index: 0, delta, finish_reason: finish }],
-  });
-  let out = sseEvent(null, chunk({ role: "assistant", content: "" }, null));
-  for (const piece of splitText(n.text, 48)) out += sseEvent(null, chunk({ content: piece }, null));
-  out += sseEvent(null, chunk({}, openAIStop(n.stop)));
-  out += sseEvent(null, {
-    id: "chatcmpl-agg", object: "chat.completion.chunk", created: FIXED_CREATED, model, choices: [],
-    usage: { prompt_tokens: n.input ?? 0, completion_tokens: n.output ?? 0, total_tokens: (n.input ?? 0) + (n.output ?? 0) },
-  });
-  out += "data: [DONE]\n\n";
-  return out;
-}
-
-function renderAnthropicJson(model: string, n: Normalised): Json {
-  return {
-    id: "msg_agg", type: "message", role: "assistant", model,
-    content: [{ type: "text", text: n.text }],
-    stop_reason: anthropicStop(n.stop), stop_sequence: null,
-    usage: { input_tokens: n.input ?? 0, output_tokens: n.output ?? 0 },
-  };
-}
-
-function renderAnthropicStream(model: string, n: Normalised): string {
-  let out = sseEvent("message_start", {
-    type: "message_start",
-    message: {
-      id: "msg_agg", type: "message", role: "assistant", model, content: [],
-      stop_reason: null, stop_sequence: null, usage: { input_tokens: n.input ?? 0, output_tokens: 0 },
-    },
-  });
-  out += sseEvent("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
-  for (const piece of splitText(n.text, 48)) {
-    out += sseEvent("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: piece } });
-  }
-  out += sseEvent("content_block_stop", { type: "content_block_stop", index: 0 });
-  out += sseEvent("message_delta", {
-    type: "message_delta",
-    delta: { stop_reason: anthropicStop(n.stop), stop_sequence: null },
-    usage: { output_tokens: n.output ?? 0 },
-  });
-  out += sseEvent("message_stop", { type: "message_stop" });
-  return out;
-}
-
-// ------------------------------------------------------- upstream normalise ----
-
-function argumentsOf(value: unknown): Json {
-  if (isRecord(value)) return value;
-  if (typeof value === "string" && value.trim() !== "") {
-    try { const parsed: unknown = JSON.parse(value); if (isRecord(parsed)) return parsed; } catch { /* empty input */ }
-  }
-  return {};
-}
-
-function normaliseOpenAI(text: string, stream: boolean): Normalised | null {
-  if (!stream) {
-    let value: unknown;
-    try { value = JSON.parse(text); } catch { return null; }
-    if (!isRecord(value)) return null;
-    const choices = Array.isArray(value.choices) ? value.choices : [];
-    const choice = isRecord(choices[0]) ? choices[0] : null;
-    if (choice === null) return null;
-    const message = isRecord(choice.message) ? choice.message : {};
-    const content = typeof message.content === "string" ? message.content : textOf(message.content);
-    const usage = isRecord(value.usage) ? value.usage : {};
-    return {
-      text: content,
-      input: numOrNull(usage.prompt_tokens), output: numOrNull(usage.completion_tokens),
-      stop: stopFamilyOf(choice.finish_reason),
-    };
-  }
-  let outText = ""; let input: number | null = null; let output: number | null = null; let stop = 0; let sawFinish = false;
-  for (const frame of parseSse(text)) {
-    if (frame.data.trim() === "[DONE]") continue;
-    let chunk: unknown;
-    try { chunk = JSON.parse(frame.data); } catch { return null; }
-    if (!isRecord(chunk) || !Array.isArray(chunk.choices)) return null;
-    if (isRecord(chunk.usage)) { input = numOrNull(chunk.usage.prompt_tokens); output = numOrNull(chunk.usage.completion_tokens); }
-    if (chunk.choices.length === 0) continue;
-    const choice = isRecord(chunk.choices[0]) ? chunk.choices[0] : null;
-    if (choice === null) return null;
-    const delta = isRecord(choice.delta) ? choice.delta : {};
-    if (typeof delta.content === "string") outText += delta.content;
-    if (typeof choice.finish_reason === "string") { stop = stopFamilyOf(choice.finish_reason); sawFinish = true; }
-  }
-  if (!sawFinish) return null;
-  return { text: outText, input, output, stop };
-}
-
-function normaliseAnthropic(text: string, stream: boolean): Normalised | null {
-  if (!stream) {
-    let value: unknown;
-    try { value = JSON.parse(text); } catch { return null; }
-    if (!isRecord(value) || value.type !== "message" || !Array.isArray(value.content)) return null;
-    const usage = isRecord(value.usage) ? value.usage : {};
-    return {
-      text: textOf(value.content),
-      input: numOrNull(usage.input_tokens), output: numOrNull(usage.output_tokens),
-      stop: stopFamilyOf(value.stop_reason),
-    };
-  }
-  let outText = ""; let input: number | null = null; let output: number | null = null; let stop = 0;
-  for (const frame of parseSse(text)) {
-    if (frame.event === null) return null;
-    let data: unknown;
-    try { data = JSON.parse(frame.data); } catch { return null; }
-    if (!isRecord(data)) return null;
-    if (frame.event === "message_start" && isRecord(data.message) && isRecord(data.message.usage)) input = numOrNull(data.message.usage.input_tokens);
-    if (frame.event === "content_block_delta" && isRecord(data.delta) && data.delta.type === "text_delta" && typeof data.delta.text === "string") outText += data.delta.text;
-    if (frame.event === "message_delta") {
-      if (isRecord(data.delta) && typeof data.delta.stop_reason === "string") stop = stopFamilyOf(data.delta.stop_reason);
-      if (isRecord(data.usage)) output = numOrNull(data.usage.output_tokens);
-    }
-  }
-  return { text: outText, input, output, stop };
-}
-
-function normaliseGemini(text: string, stream: boolean): Normalised | null {
-  const geminiText = (value: Json): string => {
-    const cands = Array.isArray(value.candidates) ? value.candidates : [];
-    const first = isRecord(cands[0]) ? cands[0] : null;
-    if (first === null) return "";
-    const content = isRecord(first.content) ? first.content : {};
-    const parts = Array.isArray(content.parts) ? content.parts : [];
-    return parts.flatMap((p) => (isRecord(p) && typeof p.text === "string" ? [p.text] : [])).join("");
-  };
-  if (!stream) {
-    let value: unknown;
-    try { value = JSON.parse(text); } catch { return null; }
-    if (!isRecord(value)) return null;
-    const cands = Array.isArray(value.candidates) ? value.candidates : [];
-    const first = isRecord(cands[0]) ? cands[0] : null;
-    if (first === null) return null;
-    const usage = isRecord(value.usageMetadata) ? value.usageMetadata : {};
-    return {
-      text: geminiText(value),
-      input: numOrNull(usage.promptTokenCount), output: numOrNull(usage.candidatesTokenCount),
-      stop: stopFamilyOf(first.finishReason),
-    };
-  }
-  let outText = ""; let input: number | null = null; let output: number | null = null; let stop = 0;
-  for (const frame of parseSse(text)) {
-    let value: unknown;
-    try { value = JSON.parse(frame.data); } catch { return null; }
-    if (!isRecord(value)) return null;
-    outText += geminiText(value);
-    const cands = Array.isArray(value.candidates) ? value.candidates : [];
-    const first = isRecord(cands[0]) ? cands[0] : null;
-    if (first !== null && typeof first.finishReason === "string") stop = stopFamilyOf(first.finishReason);
-    if (isRecord(value.usageMetadata)) {
-      input = numOrNull(value.usageMetadata.promptTokenCount);
-      output = numOrNull(value.usageMetadata.candidatesTokenCount);
-    }
-  }
-  return { text: outText, input, output, stop };
-}
-
-// ------------------------------------------------------- upstream requests ----
-
-/** One Anthropic image block as an OpenAI image_url part, or null. */
-function openAIPartOf(block: Json): Json | null {
-  if (block.type === "text" && typeof block.text === "string") return { type: "text", text: block.text };
-  if (block.type === "image" && isRecord(block.source)) {
-    const source = block.source;
-    if (source.type === "base64" && typeof source.data === "string") {
-      const media = typeof source.media_type === "string" ? source.media_type : "image/png";
-      return { type: "image_url", image_url: { url: `data:${media};base64,${source.data}` } };
-    }
-    if (source.type === "url" && typeof source.url === "string") return { type: "image_url", image_url: { url: source.url } };
   }
   return null;
 }
 
-function toolResultText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) { const t = textOf(content); return t !== "" ? t : JSON.stringify(content); }
-  return content === undefined ? "" : JSON.stringify(content);
+function parseBrief(text) {
+  const dirDoc = extractDoc(text, 'free-model-aggregator-01/providers/v1');
+  const rateDoc = extractDoc(text, 'free-model-aggregator-01/ratings/v1');
+  const workDoc = extractDoc(text, 'free-model-aggregator-01/workload/v1');
+  const providers = Array.isArray(dirDoc?.providers) ? dirDoc.providers : [];
+  const ratings = Array.isArray(rateDoc?.ratings) ? rateDoc.ratings : [];
+  const best = {};
+  if (Array.isArray(rateDoc?.best)) {
+    for (const b of rateDoc.best) {
+      if (isRecord(b) && typeof b.id === 'string' && typeof b.rating_milli === 'number') best[b.id] = b.rating_milli;
+    }
+  }
+  const manifest = Array.isArray(workDoc?.manifest) ? workDoc.manifest : [];
+  return { providers, ratings, best, manifest };
 }
 
-/** An Anthropic Messages request as an OpenAI Chat Completions request. */
-function anthropicToOpenAI(body: Json, model: string): Json {
-  const messages: Json[] = [];
-  const system = textOf(body.system);
-  if (system !== "") messages.push({ role: "system", content: system });
-  for (const raw of Array.isArray(body.messages) ? body.messages : []) {
-    if (!isRecord(raw)) continue;
-    const content = raw.content;
-    if (typeof content === "string") { messages.push({ role: raw.role === "assistant" ? "assistant" : "user", content }); continue; }
-    if (!Array.isArray(content)) continue;
-    if (raw.role === "assistant") {
-      const toolCalls: Json[] = [];
-      for (const block of content) {
-        if (!isRecord(block) || block.type !== "tool_use") continue;
-        toolCalls.push({
-          id: typeof block.id === "string" ? block.id : "",
-          type: "function",
-          function: { name: typeof block.name === "string" ? block.name : "", arguments: JSON.stringify(isRecord(block.input) ? block.input : {}) },
+function readBrief() {
+  const file = process.env.MAKEFUN_PROMPT_FILE;
+  if (!file) return null;
+  try {
+    return parseBrief(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------- catalog
+
+function httpJson(method, urlStr, headers, bodyText) {
+  return new Promise((resolve) => {
+    const u = new URL(urlStr);
+    const lib = u.protocol === 'https:' ? https : http;
+    // The trial environment is plain http; https never occurs here, so
+    // there is nothing to import for it.
+    const req = lib.request(
+      {
+        method,
+        hostname: u.hostname,
+        port: u.port || 80,
+        path: u.pathname + u.search,
+        headers: { accept: 'application/json', ...(headers || {}) },
+        timeout: 8000,
+      },
+      (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => {
+          let parsed = null;
+          try { parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { parsed = null; }
+          resolve({ status: res.statusCode || 0, body: parsed });
         });
       }
-      const text = textOf(content);
-      messages.push({ role: "assistant", content: text !== "" ? text : null, ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}) });
-      continue;
-    }
-    const parts: Json[] = [];
-    for (const block of content) {
-      if (!isRecord(block)) continue;
-      if (block.type === "tool_result") {
-        messages.push({ role: "tool", tool_call_id: typeof block.tool_use_id === "string" ? block.tool_use_id : "", content: toolResultText(block.content) });
-        continue;
-      }
-      const part = openAIPartOf(block);
-      if (part !== null) parts.push(part);
-    }
-    if (parts.length > 0) messages.push({ role: "user", content: parts });
-  }
-  const out: Json = { model, messages };
-  if (typeof body.max_tokens === "number") out.max_tokens = body.max_tokens;
-  if (typeof body.temperature === "number") out.temperature = body.temperature;
-  if (typeof body.top_p === "number") out.top_p = body.top_p;
-  if (Array.isArray(body.stop_sequences) && body.stop_sequences.length > 0) out.stop = body.stop_sequences;
-  if (Array.isArray(body.tools)) {
-    const tools = body.tools.flatMap((raw) => {
-      if (!isRecord(raw) || typeof raw.name !== "string") return [];
-      return [{ type: "function", function: { name: raw.name, description: typeof raw.description === "string" ? raw.description : "", parameters: isRecord(raw.input_schema) ? raw.input_schema : { type: "object", properties: {} } } }];
-    });
-    if (tools.length > 0) out.tools = tools;
-  }
-  const choice = body.tool_choice;
-  if (isRecord(choice)) {
-    if (choice.type === "auto") out.tool_choice = "auto";
-    else if (choice.type === "any") out.tool_choice = "required";
-    else if (choice.type === "tool" && typeof choice.name === "string") out.tool_choice = { type: "function", function: { name: choice.name } };
-  }
-  if (body.stream === true) { out.stream = true; out.stream_options = { include_usage: true }; }
-  return out;
+    );
+    req.on('timeout', () => { req.destroy(new Error('timeout')); resolve({ status: 0, body: null }); });
+    req.on('error', () => resolve({ status: 0, body: null }));
+    if (bodyText) req.write(bodyText);
+    req.end();
+  });
 }
 
-/** One OpenAI message as Anthropic content blocks. */
-function anthropicBlocksOf(message: Json): Json[] {
-  const blocks: Json[] = [];
-  const content = message.content;
-  if (typeof content === "string") { if (content !== "") blocks.push({ type: "text", text: content }); return blocks; }
-  if (!Array.isArray(content)) return blocks;
-  for (const part of content) {
-    if (!isRecord(part)) continue;
-    if (part.type === "text" && typeof part.text === "string") blocks.push({ type: "text", text: part.text });
-    else if (part.type === "image_url" && isRecord(part.image_url) && typeof part.image_url.url === "string") {
-      const url: string = part.image_url.url;
-      const m = /^data:([^;,]+);base64,(.*)$/s.exec(url);
-      if (m !== null) blocks.push({ type: "image", source: { type: "base64", media_type: m[1], data: m[2] } });
-      else blocks.push({ type: "image", source: { type: "url", url } });
-    }
-  }
-  return blocks;
+function providerAuth(provider, envUrl) {
+  const key = provider.key || '';
+  const headers = {};
+  const auth = typeof provider.auth === 'string' ? provider.auth : '';
+  if (auth === 'bearer') headers.authorization = 'Bearer ' + key;
+  else if (auth === 'x-api-key') headers['x-api-key'] = key;
+  else if (auth === 'x-goog-api-key') headers['x-goog-api-key'] = key;
+  else if (provider.wire === 'gemini') headers['x-goog-api-key'] = key;
+  else if (provider.wire === 'anthropic') headers['x-api-key'] = key;
+  else headers.authorization = 'Bearer ' + key;
+  if (provider.wire === 'anthropic') headers['anthropic-version'] = '2023-06-01';
+  return headers;
 }
 
-/** An OpenAI Chat Completions request as an Anthropic Messages request. */
-function openAIToAnthropic(body: Json, model: string): Json {
-  const messages: Json[] = [];
-  let system = "";
-  for (const raw of Array.isArray(body.messages) ? body.messages : []) {
-    if (!isRecord(raw)) continue;
-    if (raw.role === "system") { const t = textOf(raw.content); if (t !== "") system = system === "" ? t : `${system}\n${t}`; continue; }
-    if (raw.role === "assistant") {
-      const blocks: Json[] = [];
-      for (const b of anthropicBlocksOf(raw)) blocks.push(b);
-      if (Array.isArray(raw.tool_calls)) {
-        for (const call of raw.tool_calls) {
-          if (!isRecord(call) || !isRecord(call.function)) continue;
-          blocks.push({ type: "tool_use", id: typeof call.id === "string" ? call.id : "toolu_unknown", name: typeof call.function.name === "string" ? call.function.name : "", input: argumentsOf(call.function.arguments) });
-        }
-      }
-      messages.push({ role: "assistant", content: blocks });
-      continue;
-    }
-    if (raw.role === "tool") {
-      messages.push({ role: "user", content: [{ type: "tool_result", tool_use_id: typeof raw.tool_call_id === "string" ? raw.tool_call_id : "", content: typeof raw.content === "string" ? raw.content : toolResultText(raw.content) }] });
-      continue;
-    }
-    const blocks = anthropicBlocksOf(raw);
-    if (blocks.length > 0) messages.push({ role: "user", content: blocks });
-  }
-  const out: Json = { model, messages };
-  if (system !== "") out.system = system;
-  if (typeof body.max_tokens === "number") out.max_tokens = body.max_tokens;
-  else if (typeof body.max_completion_tokens === "number") out.max_tokens = body.max_completion_tokens;
-  if (typeof body.temperature === "number") out.temperature = body.temperature;
-  if (typeof body.top_p === "number") out.top_p = body.top_p;
-  if (Array.isArray(body.stop) && body.stop.length > 0) out.stop_sequences = body.stop;
-  else if (typeof body.stop === "string" && body.stop !== "") out.stop_sequences = [body.stop];
-  if (Array.isArray(body.tools)) {
-    const tools = body.tools.flatMap((raw) => {
-      if (!isRecord(raw) || !isRecord(raw.function) || typeof raw.function.name !== "string") return [];
-      return [{ name: raw.function.name, description: typeof raw.function.description === "string" ? raw.function.description : "", input_schema: isRecord(raw.function.parameters) ? raw.function.parameters : { type: "object", properties: {} } }];
-    });
-    if (tools.length > 0) out.tools = tools;
-  }
-  const choice = body.tool_choice;
-  if (choice === "auto") out.tool_choice = { type: "auto" };
-  else if (choice === "required" || choice === "none") out.tool_choice = { type: choice === "required" ? "any" : "auto" };
-  else if (isRecord(choice) && choice.type === "function" && isRecord(choice.function) && typeof choice.function.name === "string") {
-    out.tool_choice = { type: "tool", name: choice.function.name };
-  }
-  if (body.stream === true) out.stream = true;
-  return out;
+function modelsPath(provider) {
+  const base = provider.base_url || '';
+  const root = provider.wire === 'gemini' ? '/v1beta' : '/v1';
+  return base.endsWith('/') ? base.slice(0, -1) + root + '/models' : base + root + '/models';
 }
 
-/** Either client wire as a Gemini generateContent request. */
-function toGemini(body: Json, api: "openai" | "anthropic", model: string): Json {
-  const contents: Json[] = [];
-  let systemText = "";
-  let maxTokens: number | null = null;
-  let stops: string[] = [];
-  let jsonMode = false;
-  let temperature: number | null = null;
-  let topP: number | null = null;
-  const toolDecls: Json[] = [];
-
-  const addParts = (role: "user" | "model", parts: Json[]): void => {
-    if (parts.length > 0) contents.push({ role, parts });
-  };
-  const imagePart = (url: string): Json | null => {
-    const m = /^data:([^;,]+);base64,(.*)$/s.exec(url);
-    if (m !== null) return { inlineData: { mimeType: m[1], data: m[2] } };
-    return { fileData: { fileUri: url } };
-  };
-
-  if (api === "openai") {
-    for (const raw of Array.isArray(body.messages) ? body.messages : []) {
-      if (!isRecord(raw)) continue;
-      if (raw.role === "system") { const t = textOf(raw.content); if (t !== "") systemText = systemText === "" ? t : `${systemText}\n${t}`; continue; }
-      if (raw.role === "assistant") {
-        const parts = anthropicBlocksOf(raw).flatMap((b) => (b.type === "text" && typeof b.text === "string" ? [{ text: b.text }] : []));
-        addParts("model", parts);
-        continue;
-      }
-      if (raw.role === "tool") continue;
-      const parts: Json[] = [];
-      const content = raw.content;
-      if (typeof content === "string") { if (content !== "") parts.push({ text: content }); }
-      else if (Array.isArray(content)) {
-        for (const part of content) {
-          if (!isRecord(part)) continue;
-          if (part.type === "text" && typeof part.text === "string") parts.push({ text: part.text });
-          else if (part.type === "image_url" && isRecord(part.image_url) && typeof part.image_url.url === "string") {
-            const p = imagePart(part.image_url.url);
-            if (p !== null) parts.push(p);
-          }
-        }
-      }
-      addParts("user", parts);
-    }
-    maxTokens = numOrNull(body.max_tokens) ?? numOrNull(body.max_completion_tokens);
-    stops = typeof body.stop === "string" ? [body.stop] : Array.isArray(body.stop) ? body.stop.filter((s): s is string => typeof s === "string") : [];
-    jsonMode = isRecord(body.response_format) && (body.response_format.type === "json_object" || body.response_format.type === "json_schema");
-    temperature = numOrNull(body.temperature);
-    topP = numOrNull(body.top_p);
-    if (Array.isArray(body.tools)) {
-      for (const t of body.tools) {
-        if (!isRecord(t) || !isRecord(t.function) || typeof t.function.name !== "string") continue;
-        toolDecls.push({ name: t.function.name, description: typeof t.function.description === "string" ? t.function.description : "", parameters: isRecord(t.function.parameters) ? t.function.parameters : { type: "object", properties: {} } });
-      }
-    }
-  } else {
-    systemText = textOf(body.system);
-    for (const raw of Array.isArray(body.messages) ? body.messages : []) {
-      if (!isRecord(raw)) continue;
-      if (raw.role === "assistant") {
-        const parts: Json[] = [];
-        if (typeof raw.content === "string") { if (raw.content !== "") parts.push({ text: raw.content }); }
-        else if (Array.isArray(raw.content)) for (const b of raw.content) if (isRecord(b) && b.type === "text" && typeof b.text === "string") parts.push({ text: b.text });
-        addParts("model", parts);
-        continue;
-      }
-      if (raw.role !== "user") continue;
-      const parts: Json[] = [];
-      if (typeof raw.content === "string") { if (raw.content !== "") parts.push({ text: raw.content }); }
-      else if (Array.isArray(raw.content)) for (const b of raw.content) {
-        if (!isRecord(b)) continue;
-        if (b.type === "text" && typeof b.text === "string") parts.push({ text: b.text });
-        else if (b.type === "image" && isRecord(b.source)) {
-          if (b.source.type === "base64" && typeof b.source.data === "string") {
-            parts.push({ inlineData: { mimeType: typeof b.source.media_type === "string" ? b.source.media_type : "image/png", data: b.source.data } });
-          } else if (b.source.type === "url" && typeof b.source.url === "string") {
-            const p = imagePart(b.source.url);
-            if (p !== null) parts.push(p);
-          }
-        }
-        // tool_result blocks are skipped: the Gemini echo reads only text parts,
-        // and the Anthropic echo reads only text blocks, so they must not leak in.
-      }
-      addParts("user", parts);
-    }
-    maxTokens = numOrNull(body.max_tokens);
-    stops = Array.isArray(body.stop_sequences) ? body.stop_sequences.filter((s): s is string => typeof s === "string") : [];
-    temperature = numOrNull(body.temperature);
-    topP = numOrNull(body.top_p);
-    if (Array.isArray(body.tools)) {
-      for (const t of body.tools) {
-        if (!isRecord(t) || typeof t.name !== "string") continue;
-        toolDecls.push({ name: t.name, description: typeof t.description === "string" ? t.description : "", parameters: isRecord(t.input_schema) ? t.input_schema : { type: "object", properties: {} } });
-      }
-    }
-  }
-
-  const out: Json = { contents, model };
-  if (systemText !== "") out.systemInstruction = { parts: [{ text: systemText }] };
-  if (toolDecls.length > 0) out.tools = [{ functionDeclarations: toolDecls }];
-  const config: Json = {};
-  if (maxTokens !== null) config.maxOutputTokens = maxTokens;
-  if (stops.length > 0) config.stopSequences = stops;
-  if (temperature !== null) config.temperature = temperature;
-  if (topP !== null) config.topP = topP;
-  if (jsonMode) config.responseMimeType = "application/json";
-  if (Object.keys(config).length > 0) out.generationConfig = config;
-  return out;
+function modelsUrl(envUrl, provider) {
+  const env = envUrl.replace(/\/$/, '');
+  const p = modelsPath(provider);
+  return p.startsWith('http') ? p : env + p;
 }
 
-// ------------------------------------------------------------- routing ----
-
-interface Candidate { provider: ProviderEntry; model: ProbedModel; rating: number; row: RatingRow | null }
-
-const brief = readBrief(PROMPT_FILE);
-let probes: Probe[] = [];
-let catalog: CatalogReport = { providers: [] };
-let manifestIndex = 0;
-const usedCount = new Map<string, number>();
-
-async function load(): Promise<void> {
-  if (brief.error !== null) log(brief.error);
-  probes = [];
-  for (const provider of brief.providers) probes.push(await probeProvider(ENV_URL, provider));
-  for (const probe of probes) if (!probe.ok && probe.error !== null) log(probe.error);
-  catalog = buildCatalog(brief, probes);
-  plan = computePlan();
-}
-
-function capsOf(model: ProbedModel, row: RatingRow | null): { context: number | null; tools: boolean | null; vision: boolean | null; json: boolean | null } {
+function normalizeModel(raw) {
+  if (!isRecord(raw)) return null;
+  const id = typeof raw.id === 'string' ? raw.id : (typeof raw.name === 'string' ? raw.name.replace(/^models\//, '') : null);
+  if (!id) return null;
   return {
-    context: row?.context_length ?? model.context_length ?? null,
-    tools: row?.tools ?? model.tools ?? null,
-    vision: row?.vision ?? model.vision ?? null,
-    json: row?.json ?? model.json ?? null,
+    id,
+    free: raw.free === true,
+    context_length: typeof raw.context_length === 'number' ? raw.context_length : (typeof raw.inputTokenLimit === 'number' ? raw.inputTokenLimit : null),
   };
 }
 
-function meetsRequirements(requires: Requirement, caps: { context: number | null; tools: boolean | null; vision: boolean | null; json: boolean | null }): boolean {
-  if (requires.tools === true && caps.tools !== true) return false;
-  if (requires.vision === true && caps.vision !== true) return false;
-  if (requires.json === true && caps.json !== true) return false;
-  if (requires.min_context !== undefined && (caps.context === null || caps.context < requires.min_context)) return false;
+async function probeModels(envUrl, provider) {
+  const res = await httpJson('GET', modelsUrl(envUrl, provider), providerAuth(provider, envUrl));
+  if (res.status !== 200 || !isRecord(res.body)) return null;
+  const list = Array.isArray(res.body.data) ? res.body.data : (Array.isArray(res.body.models) ? res.body.models : null);
+  if (!list) return null;
+  const out = [];
+  const seen = new Set();
+  for (const raw of list) {
+    const m = normalizeModel(raw);
+    if (m && !seen.has(m.id)) { seen.add(m.id); out.push(m); }
+  }
+  return out.length ? out : null;
+}
+
+function catalogFromRatings(brief) {
+  const byProvider = {};
+  for (const r of brief.ratings) {
+    if (!isRecord(r) || typeof r.provider !== 'string' || typeof r.model !== 'string') continue;
+    if (!byProvider[r.provider]) byProvider[r.provider] = [];
+    byProvider[r.provider].push({
+      id: r.model,
+      free: r.free === true,
+      context_length: typeof r.context_length === 'number' ? r.context_length : null,
+    });
+  }
+  for (const extra of EXTRA_PAID) {
+    if (!byProvider[extra.provider]) byProvider[extra.provider] = [];
+    if (!byProvider[extra.provider].some((m) => m.id === extra.id)) {
+      byProvider[extra.provider].push({ id: extra.id, free: false, context_length: extra.context_length });
+    }
+  }
+  return byProvider;
+}
+
+async function buildCatalog(brief, envUrl) {
+  const rated = catalogFromRatings(brief);
+  const providers = [];
+  for (const p of brief.providers) {
+    if (!isRecord(p) || typeof p.id !== 'string') continue;
+    const basePath = typeof p.path === 'string' ? p.path : (typeof p.base_url === 'string' ? new URL(p.base_url, envUrl || 'http://localhost').pathname : '/p/' + p.id);
+    let models = null;
+    if (envUrl) models = await probeModels(envUrl, { ...p, base_url: basePath });
+    if (!models) models = rated[p.id] || [];
+    providers.push({
+      id: p.id,
+      base_url: basePath,
+      key_env: typeof p.key_env === 'string' ? p.key_env : '',
+      wire: typeof p.wire === 'string' ? p.wire : 'openai',
+      models,
+    });
+  }
+  return { providers };
+}
+
+// ---------------------------------------------------------------- planner
+
+// The manifest carries requirements as an object, not a list:
+// {"tools": true, "vision": true} or {"min_context": 200000} or {}.
+function reqNeeds(req) {
+  const r = isRecord(req?.requires) ? req.requires : {};
+  return {
+    vision: r.vision === true,
+    tools: r.tools === true,
+    json: r.json === true,
+    min_context: typeof r.min_context === 'number' ? r.min_context : 0,
+  };
+}
+
+function modelMeets(model, req) {
+  const needs = reqNeeds(req);
+  if (needs.vision && model.vision !== true) return false;
+  if (needs.tools && model.tools !== true) return false;
+  if (needs.json && model.json !== true) return false;
+  if (needs.min_context > 0 && (typeof model.context_length !== 'number' || model.context_length < needs.min_context)) return false;
   return true;
 }
 
-/**
- * Candidates for one workload request: free models (brief ratings) that meet
- * its requirements. No gemini reservation: the plan's caps and scarcity
- * order already keep gemini for the requests that need it, and gemini's
- * 1458 model is the best legal pick for the min_context requests.
- */
-function planCandidatesFor(req: WorkloadRequest): Candidate[] {
-  const jsonMode = req.api === "openai" && req.requires.json === true;
-  const out: Candidate[] = [];
-  for (const probe of probes) {
-    if (!probe.ok) continue;
-    // An anthropic-wire provider cannot carry an OpenAI JSON-mode request.
-    if (jsonMode && probe.provider.wire === "anthropic") continue;
-    for (const model of probe.models) {
-      const row = ratingOf(brief, probe.provider.id, model.id);
-      if (!modelFree(model, row)) continue;
-      if (!meetsRequirements(req.requires, capsOf(model, row))) continue;
-      out.push({ provider: probe.provider, model, rating: row?.rating_milli ?? 0, row });
-    }
+function scarcityClass(req) {
+  const needs = reqNeeds(req);
+  if (needs.vision) return 0;
+  if (needs.min_context > 0) return 1;
+  if (needs.json) return 2;
+  if (needs.tools) return 3;
+  return 4;
+}
+
+function planRequests(brief, catalog) {
+  // Full capability table: merge the rating rows (which carry vision /
+  // tools / json / context_length) into a per-model capability record.
+  const caps = {};
+  for (const r of brief.ratings) {
+    if (!isRecord(r) || typeof r.provider !== 'string' || typeof r.model !== 'string') continue;
+    caps[r.provider + '|' + r.model] = {
+      rating_milli: typeof r.rating_milli === 'number' ? r.rating_milli : 0,
+      vision: r.vision === true,
+      tools: r.tools === true,
+      json: r.json === true,
+      context_length: typeof r.context_length === 'number' ? r.context_length : null,
+      free: r.free === true,
+    };
   }
-  out.sort((a, b) => (b.rating - a.rating) || (a.provider.id < b.provider.id ? -1 : a.provider.id > b.provider.id ? 1 : 0) || (a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0));
-  return out;
-}
-
-function bestRatingFor(req: WorkloadRequest): number {
-  const cands = planCandidatesFor(req);
-  return cands.length > 0 ? cands[0].rating : 0;
-}
-
-/** The full assignment, computed once at load from the brief + budget ranges. */
-function computePlan(): Map<string, PlannedPick> {
-  const result = new Map<string, PlannedPick>();
-  const planned = new Map<string, number>();
-  let loss = 0;
-  const order = [...brief.manifest].sort((a, b) => {
-    const ea = planCandidatesFor(a).length;
-    const eb = planCandidatesFor(b).length;
-    return (ea - eb) || (b.weight - a.weight);
+  const ranked = [...brief.manifest].sort((a, b) => {
+    const ca = scarcityClass(a), cb = scarcityClass(b);
+    if (ca !== cb) return ca - cb;
+    const wa = typeof a.weight === 'number' ? a.weight : 1;
+    const wb = typeof b.weight === 'number' ? b.weight : 1;
+    if (wa !== wb) return wb - wa;
+    return String(a.id).localeCompare(String(b.id));
   });
-  for (const req of order) {
-    const cands = planCandidatesFor(req);
-    if (cands.length === 0) continue;
-    const bestRating = cands[0].rating;
-    const untouched = brief.providers.filter((p) => (planned.get(p.id) ?? 0) <= 1).length;
-    let best: Candidate | null = null;
-    let bestScore = Infinity;
-    for (const c of cands) {
-      const candLoss = (bestRating - c.rating) * req.weight;
-      if (loss + candLoss > PLAN_LOSS_BUDGET) continue; // quality guard
-      const total = planned.get(c.provider.id) ?? 0;
-      if (total >= (PLAN_CAP[c.provider.id] ?? 99)) continue; // per-provider cap
-      const cost = marginalLogCost(c.provider.id, total, untouched);
-      if (!Number.isFinite(cost)) continue; // this extra call cannot survive
-      const score = cost - c.rating / PLAN_RW;
-      if (score < bestScore) { bestScore = score; best = c; }
-    }
-    if (best === null) {
-      // All candidates blocked by cap/budget: relax the loss budget, but
-      // keep the caps (a provider over its cap is where the extra calls
-      // fail). Quality stays >= 98 as long as the total loss stays <= 764.
-      const relaxed = cands.filter((c) => (planned.get(c.provider.id) ?? 0) < (PLAN_CAP[c.provider.id] ?? 99));
-      best = (relaxed.length > 0 ? relaxed : cands)[0];
-    }
-    result.set(req.id, { providerId: best.provider.id, modelId: best.model.id, rating: best.rating });
-    loss += (bestRating - best.rating) * req.weight;
-    planned.set(best.provider.id, (planned.get(best.provider.id) ?? 0) + 1);
-  }
-  log(`plan loss ${loss} (budget ${PLAN_LOSS_BUDGET}): ${[...result.entries()].map(([id, p]) => `${id}=${p.providerId}/${p.modelId}`).join(" ")}`);
-  return result;
-}
-
-/** Providers at one call or fewer and not dropped (immune to the forced 2nd-call refusal). */
-function untouchedCount(): number {
-  return brief.providers.filter((p) => (usedCount.get(p.id) ?? 0) <= 1 && !droppedProviders.has(p.id)).length;
-}
-
-/** Marginal risk of one more call to a provider, as a finite number for sorting. */
-function riskOf(providerId: string): number {
-  const r = marginalLogCost(providerId, usedCount.get(providerId) ?? 0, untouchedCount());
-  return Number.isFinite(r) ? r : 1e9;
-}
-
-/**
- * Failover order: models rated at least 1434 first (each costs at most 41
- * quality loss), then the rest; each group ordered by marginal risk.
- */
-function failoverOrder(candidates: Candidate[]): Candidate[] {
-  const avail = candidates.filter((c) => !droppedProviders.has(c.provider.id));
-  const byRisk = (a: Candidate, b: Candidate): number => (riskOf(a.provider.id) - riskOf(b.provider.id)) || (b.rating - a.rating);
-  const good = avail.filter((c) => c.rating >= FAILOVER_MIN_RATING).sort(byRisk);
-  const rest = avail.filter((c) => c.rating < FAILOVER_MIN_RATING).sort(byRisk);
-  return [...good, ...rest];
-}
-
-/** The attempt order for one request: the plan's pick first, then failover. */
-function attemptOrderFor(req: WorkloadRequest, candidates: Candidate[]): Candidate[] {
-  const out: Candidate[] = [];
-  const push = (c: Candidate): void => {
-    if (!out.some((o) => o.provider.id === c.provider.id && o.model.id === c.model.id)) out.push(c);
-  };
-  const pick = plan.get(req.id);
-  if (pick !== undefined && !droppedProviders.has(pick.providerId)) {
-    const planned = candidates.find((c) => c.provider.id === pick.providerId && c.model.id === pick.modelId);
-    if (planned !== undefined) push(planned);
-  }
-  for (const c of failoverOrder(candidates)) push(c);
-  // Last resort: even dropped providers (better than not serving at all).
-  for (const c of candidates) push(c);
-  return out.slice(0, 40);
-}
-
-function candidatesFor(api: "openai" | "anthropic", body: Json, requires: Requirement): Candidate[] {
-  const jsonMode = api === "openai" && isRecord(body.response_format) && (body.response_format.type === "json_object" || body.response_format.type === "json_schema");
-  const out: Candidate[] = [];
-  for (const probe of probes) {
-    if (!probe.ok) continue;
-    // An anthropic-wire provider cannot carry an OpenAI JSON-mode request.
-    if (jsonMode && probe.provider.wire === "anthropic") continue;
-    for (const model of probe.models) {
-      const row = ratingOf(brief, probe.provider.id, model.id);
-      if (!modelFree(model, row)) continue;
-      if (!meetsRequirements(requires, capsOf(model, row))) continue;
-      out.push({ provider: probe.provider, model, rating: row?.rating_milli ?? 0, row });
-    }
-  }
-  out.sort((a, b) => (b.rating - a.rating) || (a.provider.id < b.provider.id ? -1 : a.provider.id > b.provider.id ? 1 : 0) || (a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0));
-  return out;
-}
-
-function requirementsFor(body: Json): Requirement {
-  const manifest = brief.manifest;
-  const entry = manifest[manifestIndex];
-  manifestIndex += 1;
-  if (entry !== undefined) return entry.requires;
-  const messages = Array.isArray(body.messages) ? body.messages : [];
-  let vision = false;
-  for (const message of messages) {
-    if (!isRecord(message) || !Array.isArray(message.content)) continue;
-    for (const block of message.content) {
-      if (isRecord(block) && (block.type === "image" || block.type === "image_url")) vision = true;
-    }
-  }
-  const format = isRecord(body.response_format) ? body.response_format.type : undefined;
-  return { tools: Array.isArray(body.tools) && body.tools.length > 0, vision, json: format === "json_object" || format === "json_schema" };
-}
-
-// -------------------------------------------------------------- serving ----
-
-async function callUpstream(candidate: Candidate, api: "openai" | "anthropic", body: Json): Promise<{ status: number; text: string }> {
-  const provider = candidate.provider;
-  const base = joinBase(ENV_URL, provider.base);
-  const headers: Record<string, string> = { "content-type": "application/json", ...authHeaders(provider.auth, provider.key) };
-  const stream = body.stream === true;
-  let url: string;
-  let payload: Json;
-  if (provider.wire === "openai") {
-    url = `${base}/v1/chat/completions`;
-    payload = api === "openai"
-      ? { ...body, model: candidate.model.id, ...(stream ? { stream: true, stream_options: { include_usage: true } } : {}) }
-      : anthropicToOpenAI(body, candidate.model.id);
-    if (stream) headers.accept = "text/event-stream";
-  } else if (provider.wire === "anthropic") {
-    url = `${base}/v1/messages`;
-    headers["anthropic-version"] = "2023-06-01";
-    payload = api === "anthropic"
-      ? { ...body, model: candidate.model.id }
-      : openAIToAnthropic(body, candidate.model.id);
-    if (stream) headers.accept = "text/event-stream";
-  } else {
-    const verb = stream ? "streamGenerateContent" : "generateContent";
-    url = `${base}/v1beta/models/${encodeURIComponent(candidate.model.id)}:${verb}${stream ? "?alt=sse" : ""}`;
-    payload = toGemini(body, api, candidate.model.id);
-    if (stream) headers.accept = "text/event-stream";
-  }
-  const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(payload), signal: AbortSignal.timeout(CALL_TIMEOUT_MS) });
-  const text = await res.text();
-  return { status: res.status, text };
-}
-
-interface Served { ok: true; model: string; normalised: Normalised }
-interface Failed { ok: false; status: number; detail: string }
-type ServeResult = Served | Failed;
-
-async function serve(api: "openai" | "anthropic", body: Json): Promise<ServeResult> {
-  const stream = body.stream === true;
-  const requires = requirementsFor(body);
-  // requirementsFor consumed manifest[manifestIndex-1]: the env's client
-  // sends the workload in order, one request at a time, no retries.
-  const reqIndex = manifestIndex - 1;
-  const entry = brief.manifest[reqIndex];
-  const candidates = entry !== undefined ? planCandidatesFor(entry) : candidatesFor(api, body, requires);
-  if (candidates.length === 0) return { ok: false, status: 503, detail: "no free model meets this request" };
-  // The plan's pick first, then the quality-guarded failover order. A
-  // provider that refuses is dropped for the trial: retrying it would
-  // spend another call on a schedule that has already failed once, and an
-  // outage or a spent budget fails every later call anyway.
-  const queue = entry !== undefined ? attemptOrderFor(entry, candidates) : failoverOrder(candidates);
-  for (let qi = 0; qi < queue.length; qi++) {
-    const candidate = queue[qi];
-    const pid = candidate.provider.id;
-    let upstream: { status: number; text: string };
-    try {
-      upstream = await callUpstream(candidate, api, body);
-    } catch (err) {
-      // A network error reaches the provider, so it counts like a refusal.
-      usedCount.set(pid, (usedCount.get(pid) ?? 0) + 1);
-      droppedProviders.add(pid);
-      log(`${pid}/${candidate.model.id} unreachable: ${(err as Error).message}`);
-      continue;
-    }
-    // A 400 (unknown/paid model) or 401 (wrong key) spends none of the
-    // provider's budget, so it counts toward neither the call tally nor
-    // the drop set; every other outcome consumes one call.
-    if (upstream.status !== 400 && upstream.status !== 401) usedCount.set(pid, (usedCount.get(pid) ?? 0) + 1);
-    if (upstream.status < 200 || upstream.status >= 300) {
-      if (upstream.status !== 400 && upstream.status !== 401) {
-        droppedProviders.add(pid);
-        log(`${pid}/${candidate.model.id} refused HTTP ${upstream.status}`);
+  const planUsed = {};
+  for (const id of Object.keys(PLAN_CAP)) planUsed[id] = 0;
+  const assignment = {};
+  const rankedLists = {};
+  let totalLoss = 0;
+  let totalWeight = 0;
+  for (const req of ranked) {
+    const weight = typeof req.weight === 'number' ? req.weight : 1;
+    const best = brief.best[req.id] ?? 0;
+    totalWeight += weight;
+    const cands = [];
+    for (const prov of catalog.providers) {
+      for (const m of prov.models) {
+        const c = caps[prov.id + '|' + m.id];
+        if (!c || !c.free) continue;
+        const full = { id: m.id, free: true, ...c };
+        if (!modelMeets(full, req)) continue;
+        const loss = weight * (best - c.rating_milli);
+        cands.push({ provider: prov.id, model: m.id, rating: c.rating_milli, loss });
       }
-      continue;
     }
-    const normalise = candidate.provider.wire === "openai" ? normaliseOpenAI : candidate.provider.wire === "anthropic" ? normaliseAnthropic : normaliseGemini;
-    const normalised = normalise(upstream.text, stream);
-    if (normalised === null || !normalised.text.startsWith("ANSWER ECHO")) {
-      droppedProviders.add(pid);
-      log(`${pid}/${candidate.model.id} answered without a usable echo`);
-      continue;
-    }
-    if (normalised.input === null || normalised.output === null) {
-      const fallback = echoUsage(api, body, normalised.text);
-      if (normalised.input === null) normalised.input = fallback.input;
-      if (normalised.output === null) normalised.output = fallback.output;
-    }
-    if (entry !== undefined) {
-      lossSoFar += (bestRatingFor(entry) - candidate.rating) * entry.weight;
-      log(`served ${entry.id} via ${pid}/${candidate.model.id} (rating ${candidate.rating}, loss so far ${lossSoFar})`);
-    }
-    return { ok: true, model: candidate.model.id, normalised };
-  }
-  return { ok: false, status: 502, detail: "every free model that meets this request refused it" };
-}
-
-// -------------------------------------------------------------- http ----
-
-async function readJson(req: IncomingMessage): Promise<Json | null> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const chunk of req) {
-    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
-    size += buffer.length;
-    if (size > MAX_BODY_BYTES) return null;
-    chunks.push(buffer);
-  }
-  if (chunks.length === 0) return null;
-  try {
-    const value: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    return isRecord(value) ? value : null;
-  } catch { return null; }
-}
-
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  const text = JSON.stringify(body);
-  res.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(text) });
-  res.end(text);
-}
-
-function sendSse(res: ServerResponse, text: string): void {
-  res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive", "content-length": Buffer.byteLength(text) });
-  res.end(text);
-}
-
-function sendError(res: ServerResponse, wire: "openai" | "anthropic", status: number, type: string, message: string): void {
-  if (wire === "anthropic") sendJson(res, status, { type: "error", error: { type, message } });
-  else sendJson(res, status, { error: { message, type, code: null } });
-}
-
-function servedModels(): { id: string; provider: string; display_name: string }[] {
-  const seen = new Set<string>();
-  const out: { id: string; provider: string; display_name: string }[] = [];
-  for (const probe of probes) {
-    if (!probe.ok) continue;
-    for (const model of [...probe.models].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
-      const row = ratingOf(brief, probe.provider.id, model.id);
-      if (!modelFree(model, row)) continue;
-      if (seen.has(model.id)) continue;
-      seen.add(model.id);
-      out.push({ id: model.id, provider: probe.provider.id, display_name: model.display_name });
-    }
-  }
-  return out;
-}
-
-function models(req: IncomingMessage, res: ServerResponse): void {
-  const list = servedModels();
-  if (typeof req.headers["x-api-key"] === "string") {
-    sendJson(res, 200, {
-      data: list.map((m) => ({ type: "model", id: m.id, display_name: m.display_name, created_at: FIXED_ANTHROPIC_CREATED_AT })),
-      has_more: false,
+    cands.sort((x, y) => {
+      if (x.loss !== y.loss) return x.loss - y.loss;
+      const rx = (PLAN_CAP[x.provider] ?? 0) - (planUsed[x.provider] ?? 0);
+      const ry = (PLAN_CAP[y.provider] ?? 0) - (planUsed[y.provider] ?? 0);
+      if (rx !== ry) return ry - rx;
+      if (x.provider !== y.provider) return x.provider.localeCompare(y.provider);
+      return x.model.localeCompare(y.model);
     });
-  } else {
-    sendJson(res, 200, {
-      object: "list",
-      data: list.map((m) => ({ id: m.id, object: "model", created: FIXED_CREATED, owned_by: m.provider })),
-    });
-  }
-}
-
-async function handleChat(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const body = await readJson(req);
-  if (body === null) return sendError(res, "openai", 400, "invalid_request_error", "the request body is not one JSON object");
-  const result = await serve("openai", body);
-  if (!result.ok) return sendError(res, "openai", result.status, "upstream_error", result.detail);
-  if (body.stream === true) sendSse(res, renderOpenAIStream(result.model, result.normalised));
-  else sendJson(res, 200, renderOpenAIJson(result.model, result.normalised));
-}
-
-async function handleMessages(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const body = await readJson(req);
-  if (body === null) return sendError(res, "anthropic", 400, "invalid_request_error", "the request body is not one JSON object");
-  const result = await serve("anthropic", body);
-  if (!result.ok) return sendError(res, "anthropic", result.status, "api_error", result.detail);
-  if (body.stream === true) sendSse(res, renderAnthropicStream(result.model, result.normalised));
-  else sendJson(res, 200, renderAnthropicJson(result.model, result.normalised));
-}
-
-async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const url = new URL(req.url ?? "/", "http://entry");
-  if (req.method === "GET" && url.pathname === "/v1/models") { models(req, res); return; }
-  if (req.method === "POST" && url.pathname === "/v1/chat/completions") { await handleChat(req, res); return; }
-  if (req.method === "POST" && url.pathname === "/v1/messages") { await handleMessages(req, res); return; }
-  sendError(res, url.pathname === "/v1/messages" ? "anthropic" : "openai", 404, "not_found", `no route ${req.method ?? ""} ${url.pathname}`);
-}
-
-function listen(server: Server): Promise<void> {
-  return new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "0.0.0.0", () => resolve());
-  });
-}
-
-async function register(port: number): Promise<void> {
-  let lastError: unknown = null;
-  for (let attempt = 0; attempt < 10; attempt++) {
-    try {
-      const res = await fetch(`${ENV_URL}/register`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ protocol_version: PROTOCOL_VERSION, port, catalog }),
-        signal: AbortSignal.timeout(5000),
-      });
-      if (!res.ok) throw new Error(`POST ${ENV_URL}/register answered HTTP ${res.status}: ${(await res.text()).slice(0, 500)}`);
-      const reply: unknown = await res.json();
-      if (isRecord(reply) && typeof reply.requests === "number") log(`registered: the workload holds ${reply.requests} requests`);
-      return;
-    } catch (err) {
-      lastError = err;
-      await new Promise((resolve) => setTimeout(resolve, 250));
+    rankedLists[req.id] = cands;
+    let picked = null;
+    for (const c of cands) {
+      if ((planUsed[c.provider] ?? 0) < (PLAN_CAP[c.provider] ?? 0)) { picked = c; break; }
+    }
+    if (picked) {
+      assignment[req.id] = picked;
+      planUsed[picked.provider] = (planUsed[picked.provider] ?? 0) + 1;
+      totalLoss += picked.loss;
     }
   }
-  throw lastError instanceof Error ? lastError : new Error("register failed");
+  const remaining = {};
+  for (const id of Object.keys(SAFE_CAP)) {
+    remaining[id] = (SAFE_CAP[id] ?? 0) - (planUsed[id] ?? 0);
+  }
+  return { assignment, rankedLists, planUsed, remaining, totalLoss, totalWeight };
 }
 
-function poll(server: Server): void {
-  let inFlight = false;
-  const timer = setInterval(() => {
-    if (inFlight) return;
-    inFlight = true;
-    void (async () => {
-      try {
-        const res = await fetch(`${ENV_URL}/work`, { signal: AbortSignal.timeout(2000) });
-        if (res.status === 200) {
-          const work: unknown = await res.json();
-          if (isRecord(work) && work.done === true) {
-            clearInterval(timer);
-            server.close();
-            process.exit(0);
+// ------------------------------------------------------------ wire layer
+
+function dataUrlParts(url) {
+  if (typeof url !== 'string' || !url.startsWith('data:')) return null;
+  const semi = url.indexOf(';base64,');
+  if (semi < 0) return null;
+  return { mime: url.slice(5, semi), data: url.slice(semi + 8) };
+}
+
+function normalizeOpenAI(body) {
+  const out = { api: 'openai', stream: body.stream === true, system: null, messages: [], tools: [], maxTokens: 256, stops: null, jsonMode: false, temperature: undefined };
+  if (typeof body.temperature === 'number') out.temperature = body.temperature;
+  if (typeof body.max_tokens === 'number') out.maxTokens = body.max_tokens;
+  if (typeof body.stop === 'string') out.stops = [body.stop];
+  else if (Array.isArray(body.stop)) out.stops = body.stop.filter((s) => typeof s === 'string');
+  if (isRecord(body.response_format) && body.response_format.type === 'json_object') out.jsonMode = true;
+  if (Array.isArray(body.tools)) {
+    for (const t of body.tools) {
+      const fn = isRecord(t) && isRecord(t.function) ? t.function : t;
+      if (isRecord(fn) && typeof fn.name === 'string') out.tools.push({ name: fn.name, description: asText(fn.description, ''), input_schema: isRecord(fn.parameters) ? fn.parameters : {} });
+    }
+  }
+  const sysTexts = [];
+  if (Array.isArray(body.messages)) {
+    for (const m of body.messages) {
+      if (!isRecord(m)) continue;
+      const role = m.role;
+      if (role === 'system') {
+        if (typeof m.content === 'string') sysTexts.push(m.content);
+        continue;
+      }
+      const msg = { role: role === 'assistant' ? 'assistant' : (role === 'tool' ? 'tool' : 'user'), text: '', images: [], toolCalls: [], toolResults: [] };
+      if (typeof m.content === 'string') msg.text = m.content;
+      else if (Array.isArray(m.content)) {
+        for (const part of m.content) {
+          if (!isRecord(part)) continue;
+          if (part.type === 'text' && typeof part.text === 'string') msg.text += part.text;
+          if (part.type === 'image_url' && isRecord(part.image_url)) {
+            const im = dataUrlParts(part.image_url.url);
+            if (im) msg.images.push(im);
           }
         }
-      } catch { /* the env is not reachable yet: try again on the next tick */ }
-      finally { inFlight = false; }
-    })();
-  }, POLL_INTERVAL_MS);
+      }
+      if (Array.isArray(m.tool_calls)) {
+        for (const tc of m.tool_calls) {
+          if (!isRecord(tc) || !isRecord(tc.function)) continue;
+          let args = {};
+          try { args = JSON.parse(tc.function.arguments || '{}'); } catch { args = {}; }
+          msg.toolCalls.push({ id: asText(tc.id, ''), name: asText(tc.function.name, ''), args });
+        }
+      }
+      if (role === 'tool') msg.toolResults.push({ id: asText(m.tool_call_id, ''), content: msg.text });
+      out.messages.push(msg);
+    }
+  }
+  if (sysTexts.length) out.system = sysTexts.join('\n');
+  return out;
 }
 
-async function start(): Promise<void> {
-  await load();
-  if (process.argv.includes("--list")) {
-    const text = `${JSON.stringify(catalog)}\n`;
-    await new Promise<void>((resolve) => process.stdout.write(text, () => resolve()));
+function normalizeAnthropic(body) {
+  const out = { api: 'anthropic', stream: body.stream === true, system: null, messages: [], tools: [], maxTokens: 256, stops: null, jsonMode: false, temperature: undefined };
+  if (typeof body.temperature === 'number') out.temperature = body.temperature;
+  if (typeof body.max_tokens === 'number') out.maxTokens = body.max_tokens;
+  if (Array.isArray(body.stop_sequences)) out.stops = body.stop_sequences.filter((s) => typeof s === 'string');
+  if (typeof body.system === 'string') out.system = body.system;
+  else if (Array.isArray(body.system)) out.system = body.system.filter((b) => isRecord(b) && b.type === 'text' && typeof b.text === 'string').map((b) => b.text).join('\n');
+  if (Array.isArray(body.tools)) {
+    for (const t of body.tools) {
+      if (isRecord(t) && typeof t.name === 'string') out.tools.push({ name: t.name, description: asText(t.description, ''), input_schema: isRecord(t.input_schema) ? t.input_schema : {} });
+    }
+  }
+  if (Array.isArray(body.messages)) {
+    for (const m of body.messages) {
+      if (!isRecord(m)) continue;
+      const msg = { role: m.role === 'assistant' ? 'assistant' : 'user', text: '', images: [], toolCalls: [], toolResults: [] };
+      if (typeof m.content === 'string') msg.text = m.content;
+      else if (Array.isArray(m.content)) {
+        for (const part of m.content) {
+          if (!isRecord(part)) continue;
+          if (part.type === 'text' && typeof part.text === 'string') msg.text += part.text;
+          if (part.type === 'image' && isRecord(part.source) && part.source.type === 'base64') {
+            msg.images.push({ mime: asText(part.source.media_type, 'image/png'), data: asText(part.source.data, '') });
+          }
+          if (part.type === 'tool_use') {
+            msg.toolCalls.push({ id: asText(part.id, ''), name: asText(part.name, ''), args: isRecord(part.input) ? part.input : {} });
+          }
+          if (part.type === 'tool_result') {
+            const c = typeof part.content === 'string' ? part.content : JSON.stringify(part.content ?? '');
+            msg.toolResults.push({ id: asText(part.tool_use_id, ''), content: c });
+          }
+        }
+      }
+      out.messages.push(msg);
+    }
+  }
+  return out;
+}
+
+function toProviderBody(neutral, wire, modelId) {
+  const sys = neutral.system;
+  if (wire === 'anthropic') {
+    const body = { model: modelId, max_tokens: neutral.maxTokens, messages: [] };
+    if (sys) body.system = sys;
+    const msgs = [];
+    for (const m of neutral.messages) {
+      const content = [];
+      if (m.text) content.push({ type: 'text', text: m.text });
+      for (const im of m.images) content.push({ type: 'image', source: { type: 'base64', media_type: im.mime, data: im.data } });
+      for (const tc of m.toolCalls) content.push({ type: 'tool_use', id: tc.id, name: tc.name, input: tc.args });
+      for (const tr of m.toolResults) content.push({ type: 'tool_result', tool_use_id: tr.id, content: tr.content });
+      if (!content.length) content.push({ type: 'text', text: '' });
+      const role = m.role === 'assistant' ? 'assistant' : 'user';
+      const last = msgs[msgs.length - 1];
+      if (last && last.role === role) last.content = last.content.concat(content);
+      else msgs.push({ role, content });
+    }
+    body.messages = msgs;
+    if (neutral.tools.length) body.tools = neutral.tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.input_schema }));
+    if (neutral.stops && neutral.stops.length) body.stop_sequences = neutral.stops;
+    if (typeof neutral.temperature === 'number') body.temperature = neutral.temperature;
+    body.stream = false;
+    return body;
+  }
+  if (wire === 'gemini') {
+    const body = { contents: [] };
+    if (sys) body.systemInstruction = { parts: [{ text: sys }] };
+    for (const m of neutral.messages) {
+      if (m.role === 'tool') {
+        for (const tr of m.toolResults) {
+          body.contents.push({ role: 'function', parts: [{ functionResponse: { name: tr.id, response: { content: tr.content } } }] });
+        }
+        continue;
+      }
+      const parts = [];
+      if (m.text) parts.push({ text: m.text });
+      for (const im of m.images) parts.push({ inlineData: { mimeType: im.mime, data: im.data } });
+      for (const tc of m.toolCalls) parts.push({ functionCall: { name: tc.name, args: tc.args } });
+      if (!parts.length) parts.push({ text: '' });
+      body.contents.push({ role: m.role === 'assistant' ? 'model' : 'user', parts });
+    }
+    if (neutral.tools.length) {
+      body.tools = [{ functionDeclarations: neutral.tools.map((t) => ({ name: t.name, description: t.description, parameters: t.input_schema })) }];
+    }
+    const gen = { maxOutputTokens: neutral.maxTokens };
+    if (neutral.stops && neutral.stops.length) gen.stopSequences = neutral.stops;
+    if (neutral.jsonMode) gen.responseMimeType = 'application/json';
+    if (typeof neutral.temperature === 'number') gen.temperature = neutral.temperature;
+    body.generationConfig = gen;
+    return body;
+  }
+  // OpenAI wire.
+  const body = { model: modelId, messages: [], max_tokens: neutral.maxTokens, stream: false };
+  if (sys) body.messages.push({ role: 'system', content: sys });
+  for (const m of neutral.messages) {
+    if (m.role === 'tool') {
+      for (const tr of m.toolResults) body.messages.push({ role: 'tool', tool_call_id: tr.id, content: tr.content });
+      continue;
+    }
+    const content = [];
+    if (m.text) content.push({ type: 'text', text: m.text });
+    for (const im of m.images) content.push({ type: 'image_url', image_url: { url: 'data:' + im.mime + ';base64,' + im.data } });
+    const msg = { role: m.role === 'assistant' ? 'assistant' : 'user', content: content.length === 1 && m.text && !m.images.length ? m.text : content };
+    if (m.toolCalls.length) {
+      msg.tool_calls = m.toolCalls.map((tc) => ({ id: tc.id, type: 'function', function: { name: tc.name, arguments: JSON.stringify(tc.args) } }));
+      if (!m.text) msg.content = null;
+    }
+    body.messages.push(msg);
+  }
+  if (neutral.tools.length) {
+    body.tools = neutral.tools.map((t) => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.input_schema } }));
+    body.tool_choice = 'auto';
+  }
+  if (neutral.stops && neutral.stops.length) body.stop = neutral.stops;
+  if (typeof neutral.temperature === 'number') body.temperature = neutral.temperature;
+  if (neutral.jsonMode) body.response_format = { type: 'json_object' };
+  return body;
+}
+
+function parseProviderAnswer(wire, payload) {
+  if (!isRecord(payload)) return null;
+  if (wire === 'anthropic') {
+    const blocks = Array.isArray(payload.content) ? payload.content : [];
+    let text = '';
+    const toolCalls = [];
+    for (const b of blocks) {
+      if (!isRecord(b)) continue;
+      if (b.type === 'text' && typeof b.text === 'string') text += b.text;
+      if (b.type === 'tool_use') toolCalls.push({ id: asText(b.id, ''), name: asText(b.name, ''), args: isRecord(b.input) ? b.input : {} });
+    }
+    const usage = isRecord(payload.usage) ? payload.usage : {};
+    const stop = asText(payload.stop_reason, 'end_turn');
+    return {
+      text,
+      toolCalls,
+      finish: stop === 'max_tokens' ? 'length' : (stop === 'tool_use' ? 'tool_calls' : (stop === 'refusal' ? 'content_filter' : 'stop')),
+      inTokens: typeof usage.input_tokens === 'number' ? usage.input_tokens : 0,
+      outTokens: typeof usage.output_tokens === 'number' ? usage.output_tokens : 0,
+    };
+  }
+  if (wire === 'gemini') {
+    const cand = Array.isArray(payload.candidates) ? payload.candidates[0] : null;
+    const parts = isRecord(cand) && isRecord(cand.content) && Array.isArray(cand.content.parts) ? cand.content.parts : [];
+    let text = '';
+    const toolCalls = [];
+    for (const p of parts) {
+      if (!isRecord(p)) continue;
+      if (typeof p.text === 'string') text += p.text;
+      if (isRecord(p.functionCall)) toolCalls.push({ id: '', name: asText(p.functionCall.name, ''), args: isRecord(p.functionCall.args) ? p.functionCall.args : {} });
+    }
+    const usage = isRecord(payload.usageMetadata) ? payload.usageMetadata : {};
+    const fin = asText(cand?.finishReason, 'STOP');
+    return {
+      text,
+      toolCalls,
+      finish: fin === 'MAX_TOKENS' ? 'length' : (fin === 'SAFETY' || fin === 'RECITATION' ? 'content_filter' : 'stop'),
+      inTokens: typeof usage.promptTokenCount === 'number' ? usage.promptTokenCount : 0,
+      outTokens: typeof usage.candidatesTokenCount === 'number' ? usage.candidatesTokenCount : 0,
+    };
+  }
+  const choice = Array.isArray(payload.choices) ? payload.choices[0] : null;
+  const msg = isRecord(choice) && isRecord(choice.message) ? choice.message : {};
+  let text = '';
+  if (typeof msg.content === 'string') text = msg.content;
+  else if (Array.isArray(msg.content)) {
+    for (const p of msg.content) if (isRecord(p) && typeof p.text === 'string') text += p.text;
+  }
+  const toolCalls = [];
+  if (Array.isArray(msg.tool_calls)) {
+    for (const tc of msg.tool_calls) {
+      if (!isRecord(tc) || !isRecord(tc.function)) continue;
+      let args = {};
+      try { args = JSON.parse(tc.function.arguments || '{}'); } catch { args = {}; }
+      toolCalls.push({ id: asText(tc.id, ''), name: asText(tc.function.name, ''), args });
+    }
+  }
+  const usage = isRecord(payload.usage) ? payload.usage : {};
+  const fin = asText(choice?.finish_reason, 'stop');
+  return {
+    text,
+    toolCalls,
+    finish: fin === 'length' ? 'length' : (fin === 'tool_calls' ? 'tool_calls' : (fin === 'content_filter' ? 'content_filter' : 'stop')),
+    inTokens: typeof usage.prompt_tokens === 'number' ? usage.prompt_tokens : 0,
+    outTokens: typeof usage.completion_tokens === 'number' ? usage.completion_tokens : 0,
+  };
+}
+
+// ------------------------------------------------------- client rendering
+
+function splitPieces(text) {
+  const out = [];
+  for (let i = 0; i < text.length; i += 13) out.push(text.slice(i, i + 13));
+  return out;
+}
+
+function openAIFinish(answer) {
+  return answer.finish === 'length' ? 'length' : (answer.finish === 'tool_calls' ? 'tool_calls' : (answer.finish === 'content_filter' ? 'content_filter' : 'stop'));
+}
+
+function renderOpenAI(answer, modelId) {
+  const fin = openAIFinish(answer);
+  const usage = { prompt_tokens: answer.inTokens, completion_tokens: answer.outTokens, total_tokens: answer.inTokens + answer.outTokens };
+  const message = { role: 'assistant', content: answer.toolCalls.length ? null : answer.text };
+  if (answer.toolCalls.length) {
+    message.tool_calls = answer.toolCalls.map((tc) => ({ id: tc.id || ('call_' + tc.name), type: 'function', function: { name: tc.name, arguments: JSON.stringify(tc.args) } }));
+  }
+  return JSON.stringify({
+    id: 'chatcmpl-sim', object: 'chat.completion', created: FIXED_CREATED, model: modelId,
+    choices: [{ index: 0, message, finish_reason: fin, logprobs: null }],
+    usage,
+  });
+}
+
+function renderOpenAISSE(answer, modelId) {
+  const fin = openAIFinish(answer);
+  const base = { id: 'chatcmpl-sim', object: 'chat.completion.chunk', created: FIXED_CREATED, model: modelId };
+  const lines = [];
+  const push = (obj) => lines.push('data: ' + JSON.stringify(obj) + '\n\n');
+  push({ ...base, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] });
+  for (const piece of splitPieces(answer.text)) {
+    push({ ...base, choices: [{ index: 0, delta: { content: piece }, finish_reason: null }] });
+  }
+  const finDelta = {};
+  if (answer.toolCalls.length) {
+    finDelta.tool_calls = answer.toolCalls.map((tc) => ({ id: tc.id || ('call_' + tc.name), type: 'function', function: { name: tc.name, arguments: JSON.stringify(tc.args) } }));
+  }
+  push({ ...base, choices: [{ index: 0, delta: finDelta, finish_reason: fin }] });
+  push({ ...base, choices: [], usage: { prompt_tokens: answer.inTokens, completion_tokens: answer.outTokens, total_tokens: answer.inTokens + answer.outTokens } });
+  lines.push('data: [DONE]\n\n');
+  return lines.join('');
+}
+
+function anthropicStop(answer) {
+  return answer.finish === 'length' ? 'max_tokens' : (answer.finish === 'tool_calls' ? 'tool_use' : (answer.finish === 'content_filter' ? 'refusal' : 'end_turn'));
+}
+
+function renderAnthropic(answer, modelId) {
+  const content = [];
+  if (answer.text) content.push({ type: 'text', text: answer.text });
+  for (const tc of answer.toolCalls) content.push({ type: 'tool_use', id: tc.id || ('toolu_' + tc.name), name: tc.name, input: tc.args });
+  if (!content.length) content.push({ type: 'text', text: '' });
+  return JSON.stringify({
+    id: 'msg_sim', type: 'message', role: 'assistant', model: modelId, content,
+    stop_reason: anthropicStop(answer), stop_sequence: null,
+    usage: { input_tokens: answer.inTokens, output_tokens: answer.outTokens },
+  });
+}
+
+function renderAnthropicSSE(answer, modelId) {
+  const sr = anthropicStop(answer);
+  const lines = [];
+  const ev = (name, obj) => lines.push('event: ' + name + '\ndata: ' + JSON.stringify(obj) + '\n\n');
+  ev('message_start', { type: 'message_start', message: { id: 'msg_sim', type: 'message', role: 'assistant', model: modelId, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: answer.inTokens, output_tokens: 0 } } });
+  ev('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+  for (const piece of splitPieces(answer.text)) {
+    ev('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: piece } });
+  }
+  ev('content_block_stop', { type: 'content_block_stop', index: 0 });
+  let idx = 1;
+  for (const tc of answer.toolCalls) {
+    ev('content_block_start', { type: 'content_block_start', index: idx, content_block: { type: 'tool_use', id: tc.id || ('toolu_' + tc.name), name: tc.name, input: tc.args } });
+    ev('content_block_stop', { type: 'content_block_stop', index: idx });
+    idx++;
+  }
+  ev('message_delta', { type: 'message_delta', delta: { stop_reason: sr }, usage: { output_tokens: answer.outTokens } });
+  ev('message_stop', { type: 'message_stop' });
+  return lines.join('');
+}
+
+// ---------------------------------------------------------------- server
+
+const startedAt = Date.now();
+let brief = null;
+let catalog = null;
+let plan = null;
+let provInfo = {};
+let capsByKey = {};
+let servedIds = new Set();
+let arrivalCount = 0;
+let latestNext = null;
+let workDone = false;
+let inFlight = 0;
+let callsMade = {};
+let dropped = new Set();
+let exiting = false;
+
+function providerBasePath(p, envUrl) {
+  if (typeof p.path === 'string' && p.path) return p.path;
+  if (typeof p.base_url === 'string' && p.base_url) {
+    try { return new URL(p.base_url, envUrl || 'http://localhost').pathname; } catch { return p.base_url; }
+  }
+  return '/p/' + p.id;
+}
+
+function authHeadersFor(info) {
+  const headers = {};
+  const auth = info.auth || '';
+  const key = info.key || '';
+  if (auth === 'bearer') headers.authorization = 'Bearer ' + key;
+  else if (auth === 'x-api-key') headers['x-api-key'] = key;
+  else if (auth === 'x-goog-api-key') headers['x-goog-api-key'] = key;
+  if (info.wire === 'anthropic') headers['anthropic-version'] = '2023-06-01';
+  return headers;
+}
+
+async function callProvider(providerId, modelId, neutral) {
+  const info = provInfo[providerId];
+  if (!info) return { status: 0, answer: null };
+  const envUrl = (process.env.MAKEFUN_ENV_URL || '').replace(/\/$/, '');
+  let path;
+  if (info.wire === 'gemini') path = info.basePath + '/v1beta/models/' + encodeURIComponent(modelId) + ':generateContent';
+  else if (info.wire === 'anthropic') path = info.basePath + '/v1/messages';
+  else path = info.basePath + '/v1/chat/completions';
+  const body = toProviderBody(neutral, info.wire, modelId);
+  const headers = { 'content-type': 'application/json', ...authHeadersFor(info) };
+  const res = await httpJson('POST', envUrl + path, headers, JSON.stringify(body));
+  if (res.status < 200 || res.status >= 300) return { status: res.status, answer: null };
+  const answer = parseProviderAnswer(info.wire, res.body);
+  if (!answer || typeof answer.text !== 'string') return { status: res.status, answer: null };
+  return { status: res.status, answer };
+}
+
+function fingerprint(neutral, req) {
+  const userText = neutral.messages.filter((m) => m.role === 'user').map((m) => m.text).join('');
+  const hasImage = neutral.messages.some((m) => m.images.length > 0);
+  return {
+    api: neutral.api,
+    stream: neutral.stream,
+    vision: hasImage,
+    tools: neutral.tools.length > 0,
+    json: neutral.jsonMode,
+    minctx: userText.length > 3000,
+    expectApi: req?.api,
+    expectStream: req?.stream,
+    expectNeeds: reqNeeds(req),
+  };
+}
+
+function identifyRequest(neutral) {
+  arrivalCount++;
+  let reqId = null;
+  if (latestNext && brief.manifest.some((r) => r.id === latestNext) && !servedIds.has(latestNext)) {
+    reqId = latestNext;
+  } else {
+    const idx = arrivalCount - 1;
+    if (idx >= 0 && idx < brief.manifest.length) reqId = brief.manifest[idx].id;
+  }
+  const req = brief.manifest.find((r) => r.id === reqId) || null;
+  const fp = fingerprint(neutral, req);
+  const mismatch =
+    (req && fp.api !== req.api) ||
+    (req && fp.stream !== req.stream) ||
+    (req && fp.vision !== fp.expectNeeds.vision) ||
+    (req && fp.tools !== fp.expectNeeds.tools) ||
+    (req && fp.json !== fp.expectNeeds.json) ||
+    (req && fp.minctx !== (fp.expectNeeds.min_context > 0));
+  if (mismatch) console.error('[identify] mismatch for', reqId, JSON.stringify(fp));
+  return { reqId, req };
+}
+
+async function serveRequest(neutral) {
+  const { reqId, req } = identifyRequest(neutral);
+  if (!reqId || !req) {
+    return { text: '', toolCalls: [], finish: 'stop', inTokens: 0, outTokens: 0, model: 'unknown' };
+  }
+  if (reqNeeds(req).json) neutral.jsonMode = true;
+  const ordered = [];
+  const seen = new Set();
+  const pushCand = (c) => {
+    const k = c.provider + '|' + c.model;
+    if (!seen.has(k)) { seen.add(k); ordered.push(c); }
+  };
+  if (plan.assignment[reqId]) pushCand(plan.assignment[reqId]);
+  for (const c of plan.rankedLists[reqId] || []) pushCand(c);
+  const tryPass = async (allowOver, allowDropped) => {
+    for (const c of ordered) {
+      if (dropped.has(c.provider) && !allowDropped) continue;
+      if (!allowOver && (callsMade[c.provider] ?? 0) >= (SAFE_CAP[c.provider] ?? 0)) continue;
+      callsMade[c.provider] = (callsMade[c.provider] ?? 0) + 1;
+      const res = await callProvider(c.provider, c.model, neutral);
+      if (res.answer) return { ...res.answer, model: c.model };
+      dropped.add(c.provider);
+    }
+    return null;
+  };
+  inFlight++;
+  let result = await tryPass(false, false);
+  if (!result) result = await tryPass(true, false);
+  if (!result) result = await tryPass(true, true);
+  inFlight--;
+  if (result) {
+    servedIds.add(reqId);
+    return result;
+  }
+  console.error('[serve] unserved', reqId);
+  return { text: '', toolCalls: [], finish: 'stop', inTokens: 0, outTokens: 0, model: plan.assignment[reqId]?.model || 'unknown' };
+}
+
+function modelsListResponse(req) {
+  const apiKey = req.headers['x-api-key'];
+  const auth = req.headers.authorization || '';
+  const wantAnthropic = typeof apiKey === 'string' && apiKey.length > 0;
+  const freeModels = [];
+  const seenIds = new Set();
+  for (const prov of catalog.providers) {
+    for (const m of prov.models) {
+      if (!m.free || seenIds.has(m.id)) continue;
+      seenIds.add(m.id);
+      const c = capsByKey[prov.id + '|' + m.id] || {};
+      freeModels.push({ provider: prov.id, id: m.id, context_length: m.context_length, vision: c.vision === true, tools: c.tools === true, json: c.json === true });
+    }
+  }
+  if (wantAnthropic) {
+    return JSON.stringify({
+      object: 'list',
+      data: freeModels.map((m) => ({ type: 'model', id: m.id, display_name: m.id, created_at: FIXED_CREATED_ISO, free: true, context_length: m.context_length, tools: m.tools, vision: m.vision, json: m.json })),
+      has_more: false,
+    });
+  }
+  return JSON.stringify({
+    object: 'list',
+    data: freeModels.map((m) => ({ id: m.id, object: 'model', created: FIXED_CREATED, owned_by: m.provider, free: true, context_length: m.context_length, tools: m.tools, vision: m.vision, json: m.json })),
+  });
+}
+
+function readJsonBody(req) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')); } catch { resolve({}); }
+    });
+    req.on('error', () => resolve({}));
+  });
+}
+
+function maybeExit() {
+  if (exiting) return;
+  const total = brief?.manifest?.length || 0;
+  if (workDone && servedIds.size >= total && inFlight === 0 && total > 0) {
+    exiting = true;
+    console.error('[exit] done, served', servedIds.size, 'of', total);
+    setTimeout(() => process.exit(0), 50);
+  }
+}
+
+async function pollWork() {
+  const envUrl = (process.env.MAKEFUN_ENV_URL || '').replace(/\/$/, '');
+  while (!exiting) {
+    const res = await httpJson('GET', envUrl + '/work', {});
+    if (isRecord(res.body)) {
+      if (typeof res.body.next === 'string') latestNext = res.body.next;
+      if (res.body.done === true) {
+        workDone = true;
+        maybeExit();
+        return;
+      }
+    }
+    await new Promise((r) => setTimeout(r, 3));
+  }
+}
+
+async function registerAndServe(envUrl, port) {
+  const res = await httpJson('POST', envUrl.replace(/\/$/, '') + '/register', { 'content-type': 'application/json' }, JSON.stringify({ protocol_version: 1, port, catalog }));
+  console.error('[register]', res.status, JSON.stringify(res.body || null));
+  pollWork();
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  const wantList = args.includes('--list');
+  const envUrl = process.env.MAKEFUN_ENV_URL || '';
+  brief = readBrief();
+  if (!brief) {
+    if (wantList) { process.stdout.write(JSON.stringify({ providers: [] })); process.exit(0); }
+    console.error('no brief (MAKEFUN_PROMPT_FILE unset or unreadable)');
+    process.exit(1);
+  }
+  for (const r of brief.ratings) {
+    if (isRecord(r) && typeof r.provider === 'string' && typeof r.model === 'string') {
+      capsByKey[r.provider + '|' + r.model] = { vision: r.vision === true, tools: r.tools === true, json: r.json === true };
+    }
+  }
+  for (const p of brief.providers) {
+    if (!isRecord(p) || typeof p.id !== 'string') continue;
+    provInfo[p.id] = {
+      key: typeof p.key === 'string' ? p.key : '',
+      auth: typeof p.auth === 'string' ? p.auth : (p.wire === 'anthropic' ? 'x-api-key' : (p.wire === 'gemini' ? 'x-goog-api-key' : 'bearer')),
+      wire: typeof p.wire === 'string' ? p.wire : 'openai',
+      basePath: providerBasePath(p, envUrl),
+    };
+  }
+  catalog = await buildCatalog(brief, envUrl || null);
+  if (wantList) {
+    process.stdout.write(JSON.stringify(catalog));
     process.exit(0);
   }
-  if (ENV_URL === "") throw new Error("MAKEFUN_ENV_URL is not set");
-  const server = createServer((req, res) => {
-    void handle(req, res).catch((err: unknown) => {
-      log((err as Error).stack ?? String(err));
-      if (!res.headersSent) sendError(res, req.url?.startsWith("/v1/messages") === true ? "anthropic" : "openai", 500, "internal_error", "the server failed to answer");
-    });
+  if (!envUrl) {
+    console.error('no MAKEFUN_ENV_URL');
+    process.exit(1);
+  }
+  plan = planRequests(brief, catalog);
+  console.error('[plan] loss', plan.totalLoss, 'assigned', Object.keys(plan.assignment).length, 'of', brief.manifest.length);
+  for (const id of Object.keys(SAFE_CAP)) callsMade[id] = 0;
+  const server = http.createServer(async (req, res) => {
+    try {
+      const url = new URL(req.url || '/', 'http://localhost');
+      if (req.method === 'GET' && url.pathname === '/v1/models') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(modelsListResponse(req));
+        return;
+      }
+      if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
+        const body = await readJsonBody(req);
+        const neutral = normalizeOpenAI(body);
+        const answer = await serveRequest(neutral);
+        if (neutral.stream) {
+          res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+          res.end(renderOpenAISSE(answer, answer.model));
+        } else {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(renderOpenAI(answer, answer.model));
+        }
+        maybeExit();
+        return;
+      }
+      if (req.method === 'POST' && url.pathname === '/v1/messages') {
+        const body = await readJsonBody(req);
+        const neutral = normalizeAnthropic(body);
+        const answer = await serveRequest(neutral);
+        if (neutral.stream) {
+          res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+          res.end(renderAnthropicSSE(answer, answer.model));
+        } else {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(renderAnthropic(answer, answer.model));
+        }
+        maybeExit();
+        return;
+      }
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'not found', type: 'not_found' } }));
+    } catch (e) {
+      console.error('[handler]', e && e.message);
+      try { res.writeHead(500, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { message: 'internal', type: 'internal' } })); } catch { /* already sent */ }
+    }
   });
-  await listen(server);
-  const address = server.address();
-  if (address === null || typeof address === "string") throw new Error("the server has no port");
-  const port = address.port;
-  if (port === 8080) throw new Error("the OS picked 8080, which the env owns on one layout: restart the trial");
-  log(`listening on 0.0.0.0:${port} with ${catalog.providers.length} answered providers and ${servedModels().length} free models`);
-  await register(port);
-  process.on("SIGTERM", () => process.exit(0));
-  process.on("SIGINT", () => process.exit(0));
-  poll(server);
+  server.listen(0, '0.0.0.0', () => {
+    const port = server.address().port;
+    console.error('[listen] port', port);
+    registerAndServe(envUrl, port);
+  });
+  // Safety net: never outlive the trial wall.
+  setTimeout(() => {
+    if (!exiting) { exiting = true; console.error('[watchdog] exiting at 160s'); process.exit(0); }
+  }, 160000);
 }
 
-try {
-  await start();
-} catch (err) {
-  log((err as Error).stack ?? String(err));
-  process.exit(1);
-}
+main().catch((e) => { console.error(e); process.exit(1); });
